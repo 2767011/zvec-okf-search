@@ -30,7 +30,7 @@ df -h /opt
 ```bash
 sudo apt-get update
 sudo apt-get install -y git python3 python3-venv
-git clone https://github.com/YOUR_ACCOUNT/okf-zvec-search.git
+git clone https://github.com/2767011/zvec-okf-search.git
 cd okf-zvec-search
 sudo ./deploy/install.sh
 ```

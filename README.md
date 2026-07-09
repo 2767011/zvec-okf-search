@@ -32,7 +32,7 @@ Markdown-базе знаний в формате
 ## Быстрый запуск
 
 ```bash
-git clone https://github.com/YOUR_ACCOUNT/okf-zvec-search.git
+git clone https://github.com/2767011/zvec-okf-search.git
 cd okf-zvec-search
 sudo ./deploy/install.sh
 sudo systemctl enable --now okf-zvec-search
