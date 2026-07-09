@@ -9,6 +9,7 @@
 okf-zvec benchmark \
   --file benchmarks/queries.json \
   --service-url http://127.0.0.1:8765 \
+  --token-file ./search-token \
   --model e5 \
   --modes semantic,fts,hybrid
 ```

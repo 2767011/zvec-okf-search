@@ -90,6 +90,8 @@ OKF_ZVEC_HOME
 OKF_ZVEC_TOKEN_FILE
 OKF_ZVEC_ACTIVE_DB_FILE
 OKF_ZVEC_KEEP_VERSIONS
+OKF_ZVEC_SEARCH_TOKEN_FILE
+OKF_ZVEC_PRELOAD_MODELS
 HF_TOKEN
 ```
 
@@ -119,6 +121,62 @@ okf-zvec search "миграция" \
 Каждый результат содержит нормализованную `relevance`, использованные сигналы,
 причину попадания в выдачу и словоформы для подсветки.
 
+## Авторизация поиска
+
+Если файл `OKF_ZVEC_SEARCH_TOKEN_FILE` существует и содержит токен,
+веб-интерфейс, `/search`, `/status`, `/models` и `/metrics` требуют
+авторизацию. `/health` остаётся открытым.
+
+Браузер показывает стандартное окно входа:
+
+- имя пользователя: `okf`;
+- пароль: содержимое файла поискового токена.
+
+API принимает Basic Auth, Bearer или заголовок
+`X-OKF-Zvec-Search-Token`. PowerShell-клиент принимает `-TokenFile`:
+
+```powershell
+.\scripts\search.ps1 "миграция" `
+  -ServiceUrl http://SERVER_IP:8765 `
+  -TokenFile .\search-token
+```
+
+Если файл токена отсутствует, поиск работает без авторизации для обратной
+совместимости.
+
+## Загрузка моделей
+
+При старте сервис открывает индексы, но не загружает embedding-модели. FTS
+работает без них, а первый semantic или hybrid-запрос загружает только выбранную
+модель. Для предварительного прогрева задайте:
+
+```text
+OKF_ZVEC_PRELOAD_MODELS=e5
+OKF_ZVEC_PRELOAD_MODELS=e5,paraphrase
+OKF_ZVEC_PRELOAD_MODELS=all
+```
+
+## Состояние, журналы и метрики
+
+- `/status` — страница состояния;
+- `/status.json` — состояние в JSON;
+- `/metrics` — метрики Prometheus.
+
+Сервис пишет в stdout однострочные JSON-события: запуск, загрузка модели,
+поиск и синхронизация. Текст поискового запроса в журнал не записывается.
+
+Пример Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: okf-zvec-search
+    basic_auth:
+      username: okf
+      password_file: /secure/search-token
+    static_configs:
+      - targets: ["SERVER_IP:8765"]
+```
+
 ## Проверка качества
 
 Контрольный набор находится в `benchmarks/queries.json`. Команда сравнивает
@@ -129,6 +187,7 @@ okf-zvec search "миграция" \
 okf-zvec benchmark \
   --file benchmarks/queries.json \
   --service-url http://127.0.0.1:8765 \
+  --token-file ./search-token \
   --model e5 \
   --modes semantic,fts,hybrid
 ```

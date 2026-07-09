@@ -8,6 +8,7 @@ import base64
 import contextlib
 import fnmatch
 import hashlib
+import html
 import json
 import os
 import re
@@ -20,12 +21,13 @@ import gc
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import zvec
 import yaml
@@ -65,6 +67,9 @@ _QUERY_CACHE_MAX = 256
 _SERVICE_TOKEN_FILE = Path(
     os.environ.get("OKF_ZVEC_TOKEN_FILE", str(APP_HOME / "config" / "service-token"))
 )
+_SEARCH_TOKEN_FILE = Path(
+    os.environ.get("OKF_ZVEC_SEARCH_TOKEN_FILE", str(APP_HOME / "config" / "search-token"))
+)
 _ACTIVE_DB_FILE = Path(
     os.environ.get("OKF_ZVEC_ACTIVE_DB_FILE", str(APP_HOME / "data" / "active-db-root"))
 )
@@ -75,6 +80,72 @@ DEFAULT_SEMANTIC_WEIGHT = 1.0
 DEFAULT_FTS_WEIGHT = 1.0
 DEFAULT_MIN_RELEVANCE = 0.25
 RRF_RANK_CONSTANT = 60
+SERVICE_STARTED_AT = time.time()
+
+
+def log_event(event: str, level: str = "info", **fields: Any) -> None:
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "event": event,
+        **fields,
+    }
+    print(json.dumps(payload, ensure_ascii=False, default=str), flush=True)
+
+
+class ServiceMetrics:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.search_requests: dict[tuple[str, str, str], int] = {}
+        self.search_duration_sum: dict[tuple[str, str], float] = {}
+        self.search_duration_count: dict[tuple[str, str], int] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.sync_total: dict[str, int] = {"success": 0, "error": 0}
+        self.sync_duration_sum = 0.0
+        self.sync_duration_count = 0
+        self.model_load_seconds: dict[str, float] = {}
+
+    def record_search(self, model: str, mode: str, status: str, duration: float) -> None:
+        with self.lock:
+            status_key = (model, mode, status)
+            duration_key = (model, mode)
+            self.search_requests[status_key] = self.search_requests.get(status_key, 0) + 1
+            self.search_duration_sum[duration_key] = (
+                self.search_duration_sum.get(duration_key, 0.0) + duration
+            )
+            self.search_duration_count[duration_key] = (
+                self.search_duration_count.get(duration_key, 0) + 1
+            )
+
+    def record_cache(self, hit: bool) -> None:
+        with self.lock:
+            if hit:
+                self.cache_hits += 1
+            else:
+                self.cache_misses += 1
+
+    def record_sync(self, status: str, duration: float) -> None:
+        with self.lock:
+            self.sync_total[status] = self.sync_total.get(status, 0) + 1
+            self.sync_duration_sum += duration
+            self.sync_duration_count += 1
+
+    def record_model_load(self, model: str, duration: float) -> None:
+        with self.lock:
+            self.model_load_seconds[model] = duration
+
+
+_METRICS = ServiceMetrics()
+_STATE_LOCK = threading.Lock()
+_SERVICE_STATE: dict[str, Any] = {
+    "last_sync_at": "",
+    "last_sync_status": "never",
+    "last_sync_duration_seconds": 0.0,
+    "last_sync_error": "",
+    "active_db_root": "",
+    "models": {},
+}
 
 
 @dataclass(frozen=True)
@@ -170,6 +241,8 @@ def get_model(model_key: str = DEFAULT_MODEL) -> Any:
     if model_key in _MODELS:
         return _MODELS[model_key]
 
+    started = time.perf_counter()
+    log_event("model_load_started", model=model_key, name=MODEL_CONFIGS[model_key]["name"])
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
@@ -192,6 +265,21 @@ def get_model(model_key: str = DEFAULT_MODEL) -> Any:
             f"а схема zvec ожидает {DIMENSION}."
         )
     _MODELS[model_key] = model
+    duration = time.perf_counter() - started
+    _METRICS.record_model_load(model_key, duration)
+    with _STATE_LOCK:
+        model_state = _SERVICE_STATE["models"].setdefault(model_key, {})
+        model_state.update({
+            "name": MODEL_CONFIGS[model_key]["name"],
+            "loaded": True,
+            "load_seconds": round(duration, 3),
+        })
+    log_event(
+        "model_load_completed",
+        model=model_key,
+        name=MODEL_CONFIGS[model_key]["name"],
+        duration_seconds=round(duration, 3),
+    )
     return model
 
 
@@ -571,7 +659,9 @@ def search_collection(
     if use_cache:
         cached = _QUERY_CACHE.get(cache_key)
         if cached is not None:
+            _METRICS.record_cache(True)
             return cached
+        _METRICS.record_cache(False)
 
     pool_size = max(topk, rerank_pool)
     semantic_results: list[Any] = []
@@ -685,11 +775,19 @@ def format_search_results(results: list[dict[str, Any]], snippet: int) -> str:
     return "\n".join(lines)
 
 
-def service_token() -> str:
+def read_token_file(path: Path) -> str:
     try:
-        return _SERVICE_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return ""
+
+
+def service_token() -> str:
+    return read_token_file(_SERVICE_TOKEN_FILE)
+
+
+def search_token() -> str:
+    return read_token_file(_SEARCH_TOKEN_FILE)
 
 
 def is_authorized(headers: Any) -> bool:
@@ -697,6 +795,121 @@ def is_authorized(headers: Any) -> bool:
     if not expected:
         return False
     return secrets.compare_digest(headers.get("X-OKF-Zvec-Token", ""), expected)
+
+
+def basic_password(authorization: str) -> str:
+    if not authorization.startswith("Basic "):
+        return ""
+    try:
+        decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    username, separator, password = decoded.partition(":")
+    return password if separator and username == "okf" else ""
+
+
+def is_search_authorized(headers: Any) -> bool:
+    expected = search_token()
+    if not expected:
+        return True
+    candidates = (
+        headers.get("X-OKF-Zvec-Search-Token", ""),
+        headers.get("Authorization", "").removeprefix("Bearer ").strip(),
+        basic_password(headers.get("Authorization", "")),
+    )
+    return any(candidate and secrets.compare_digest(candidate, expected) for candidate in candidates)
+
+
+def collection_doc_count(collection: Any) -> int:
+    try:
+        stats = json.loads(str(collection.stats))
+        return int(stats.get("doc_count", 0))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 0
+
+
+def status_snapshot() -> dict[str, Any]:
+    with _STATE_LOCK:
+        state = json.loads(json.dumps(_SERVICE_STATE, default=str))
+    state.update({
+        "uptime_seconds": round(time.time() - SERVICE_STARTED_AT, 1),
+        "cache_entries": len(_QUERY_CACHE),
+        "cache_limit": _QUERY_CACHE_MAX,
+        "loaded_models": sorted(_MODELS),
+        "retained_versions": keep_versions(),
+        "search_auth_enabled": bool(search_token()),
+    })
+    return state
+
+
+def prometheus_metrics() -> str:
+    lines = [
+        "# HELP okf_zvec_uptime_seconds Время работы сервиса.",
+        "# TYPE okf_zvec_uptime_seconds gauge",
+        f"okf_zvec_uptime_seconds {time.time() - SERVICE_STARTED_AT:.3f}",
+        "# HELP okf_zvec_cache_entries Число ответов в кэше.",
+        "# TYPE okf_zvec_cache_entries gauge",
+        f"okf_zvec_cache_entries {len(_QUERY_CACHE)}",
+    ]
+    with _METRICS.lock:
+        lines.extend([
+            "# HELP okf_zvec_cache_requests_total Обращения к кэшу поиска.",
+            "# TYPE okf_zvec_cache_requests_total counter",
+            f'okf_zvec_cache_requests_total{{result="hit"}} {_METRICS.cache_hits}',
+            f'okf_zvec_cache_requests_total{{result="miss"}} {_METRICS.cache_misses}',
+            "# HELP okf_zvec_search_requests_total Поисковые запросы.",
+            "# TYPE okf_zvec_search_requests_total counter",
+        ])
+        for (model, mode, status), value in sorted(_METRICS.search_requests.items()):
+            lines.append(
+                f'okf_zvec_search_requests_total{{model="{model}",mode="{mode}",'
+                f'status="{status}"}} {value}'
+            )
+        lines.extend([
+            "# HELP okf_zvec_search_duration_seconds Время выполнения поиска.",
+            "# TYPE okf_zvec_search_duration_seconds summary",
+        ])
+        for (model, mode), value in sorted(_METRICS.search_duration_sum.items()):
+            labels = f'model="{model}",mode="{mode}"'
+            lines.append(f"okf_zvec_search_duration_seconds_sum{{{labels}}} {value:.6f}")
+            lines.append(
+                f"okf_zvec_search_duration_seconds_count{{{labels}}} "
+                f"{_METRICS.search_duration_count[(model, mode)]}"
+            )
+        lines.extend([
+            "# HELP okf_zvec_sync_total Синхронизации OKF.",
+            "# TYPE okf_zvec_sync_total counter",
+        ])
+        for status, value in sorted(_METRICS.sync_total.items()):
+            lines.append(f'okf_zvec_sync_total{{status="{status}"}} {value}')
+        lines.extend([
+            "# HELP okf_zvec_sync_duration_seconds Время синхронизации.",
+            "# TYPE okf_zvec_sync_duration_seconds summary",
+            f"okf_zvec_sync_duration_seconds_sum {_METRICS.sync_duration_sum:.6f}",
+            f"okf_zvec_sync_duration_seconds_count {_METRICS.sync_duration_count}",
+            "# HELP okf_zvec_model_loaded Загружена ли модель в память.",
+            "# TYPE okf_zvec_model_loaded gauge",
+        ])
+        for model_key in MODEL_CONFIGS:
+            loaded = 1 if model_key in _MODELS else 0
+            lines.append(f'okf_zvec_model_loaded{{model="{model_key}"}} {loaded}')
+        lines.extend([
+            "# HELP okf_zvec_model_load_seconds Время загрузки модели.",
+            "# TYPE okf_zvec_model_load_seconds gauge",
+        ])
+        for model, duration in sorted(_METRICS.model_load_seconds.items()):
+            lines.append(f'okf_zvec_model_load_seconds{{model="{model}"}} {duration:.6f}')
+    with _STATE_LOCK:
+        lines.extend([
+            "# HELP okf_zvec_index_documents Число фрагментов в индексе.",
+            "# TYPE okf_zvec_index_documents gauge",
+        ])
+        for model, model_state in sorted(_SERVICE_STATE["models"].items()):
+            lines.append(
+                f'okf_zvec_index_documents{{model="{model}"}} '
+                f'{int(model_state.get("doc_count", 0))}'
+            )
+    return "\n".join(lines) + "\n"
 
 
 def safe_extract_tar(archive: Path, target: Path) -> None:
@@ -955,6 +1168,7 @@ def benchmark_http_search(
     model_key: str,
     mode: str,
     options: SearchOptions,
+    token: str = "",
 ) -> list[dict[str, Any]]:
     params = urlencode({
         "q": query,
@@ -967,7 +1181,11 @@ def benchmark_http_search(
         "min_relevance": options.min_relevance,
         "no_cache": 1,
     })
-    with urlopen(f"{service_url.rstrip('/')}/search?{params}", timeout=30) as response:
+    request = Request(f"{service_url.rstrip('/')}/search?{params}")
+    if token:
+        credentials = base64.b64encode(f"okf:{token}".encode("utf-8")).decode("ascii")
+        request.add_header("Authorization", f"Basic {credentials}")
+    with urlopen(request, timeout=30) as response:
         payload = json.loads(response.read().decode("utf-8"))
     return payload["results"]
 
@@ -990,6 +1208,9 @@ def command_benchmark(args: argparse.Namespace) -> None:
         fts_weight=args.fts_weight,
         min_relevance=args.min_relevance,
     )
+    benchmark_token = ""
+    if args.token_file:
+        benchmark_token = Path(args.token_file).read_text(encoding="utf-8").strip()
     report: dict[str, Any] = {
         "model": model_key,
         "queries": len(tests),
@@ -1013,6 +1234,7 @@ def command_benchmark(args: argparse.Namespace) -> None:
                     model_key,
                     mode,
                     options,
+                    benchmark_token,
                 )
             else:
                 results = search_collection(
@@ -1052,23 +1274,53 @@ class SearchHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
-    def send_json(self, status: int, payload: dict[str, Any]) -> None:
+    def send_json(
+        self,
+        status: int,
+        payload: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def send_html(self, status: int, html: str) -> None:
-        body = html.encode("utf-8")
+    def send_html(
+        self,
+        status: int,
+        page: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        body = page.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def send_text(self, status: int, body_text: str, content_type: str) -> None:
+        body = body_text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_search_unauthorized(self, wants_json: bool = False) -> None:
+        headers = {"WWW-Authenticate": 'Basic realm="OKF Zvec Search", charset="UTF-8"'}
+        if wants_json:
+            self.send_json(401, {"error": "требуется авторизация"}, headers)
+        else:
+            self.send_html(401, "<h1>Требуется авторизация</h1>", headers)
 
     def render_home(self) -> str:
         return r"""<!doctype html>
@@ -1100,7 +1352,10 @@ class SearchHandler(BaseHTTPRequestHandler):
 </head>
 <body>
 <main>
-  <h1>Поиск по базе OKF</h1>
+  <div class="search-row">
+    <h1 style="flex:1">Поиск по базе OKF</h1>
+    <a href="/status">Состояние</a>
+  </div>
   <form id="searchForm">
     <div class="search-row">
       <input id="query" type="text" placeholder="миграция, портал поставщиков, прошивка кассы" autofocus>
@@ -1209,13 +1464,61 @@ function escapeHtml(value) {
 </body>
 </html>"""
 
+    def render_status(self) -> str:
+        state = status_snapshot()
+        model_rows = []
+        for model_key, config in MODEL_CONFIGS.items():
+            model_state = state["models"].get(model_key, {})
+            model_rows.append(
+                "<tr>"
+                f"<td>{html.escape(model_key)}</td>"
+                f"<td>{html.escape(config['name'])}</td>"
+                f"<td>{'да' if model_key in state['loaded_models'] else 'нет'}</td>"
+                f"<td>{int(model_state.get('doc_count', 0))}</td>"
+                "</tr>"
+            )
+        return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Состояние OKF zvec</title>
+  <style>
+    body {{ font-family: system-ui, Segoe UI, Arial, sans-serif; margin: 32px; color: #1f2937; background: #f8fafc; }}
+    main {{ max-width: 980px; margin: 0 auto; }}
+    table {{ width: 100%; border-collapse: collapse; background: white; }}
+    th, td {{ text-align: left; padding: 10px; border: 1px solid #e2e8f0; }}
+    dl {{ display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; }}
+    dt {{ color: #64748b; }}
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="/">Поиск</a></p>
+  <h1>Состояние сервиса</h1>
+  <dl>
+    <dt>Активный индекс</dt><dd>{html.escape(str(state['active_db_root']))}</dd>
+    <dt>Последняя синхронизация</dt><dd>{html.escape(str(state['last_sync_at'] or 'нет'))}</dd>
+    <dt>Статус синхронизации</dt><dd>{html.escape(str(state['last_sync_status']))}</dd>
+    <dt>Длительность</dt><dd>{float(state['last_sync_duration_seconds']):.2f} с</dd>
+    <dt>Версий индекса</dt><dd>{int(state['retained_versions'])}</dd>
+    <dt>Записей в кэше</dt><dd>{int(state['cache_entries'])} / {int(state['cache_limit'])}</dd>
+    <dt>Время работы</dt><dd>{float(state['uptime_seconds']):.1f} с</dd>
+    <dt>Авторизация поиска</dt><dd>{'включена' if state['search_auth_enabled'] else 'отключена'}</dd>
+  </dl>
+  <h2>Модели и индексы</h2>
+  <table>
+    <thead><tr><th>Ключ</th><th>Модель</th><th>В памяти</th><th>Фрагментов</th></tr></thead>
+    <tbody>{''.join(model_rows)}</tbody>
+  </table>
+</main>
+</body>
+</html>"""
+
     def do_GET(self) -> None:
         global _SEARCH_COLLECTIONS
 
         parsed = urlparse(self.path)
-        if parsed.path == "/":
-            self.send_html(200, self.render_home())
-            return
         if parsed.path == "/health":
             self.send_json(
                 200,
@@ -1225,6 +1528,21 @@ function escapeHtml(value) {
                     "models": {key: value["name"] for key, value in MODEL_CONFIGS.items()},
                 },
             )
+            return
+        if not is_search_authorized(self.headers):
+            self.send_search_unauthorized(wants_json=parsed.path != "/")
+            return
+        if parsed.path == "/":
+            self.send_html(200, self.render_home())
+            return
+        if parsed.path == "/status":
+            self.send_html(200, self.render_status())
+            return
+        if parsed.path == "/status.json":
+            self.send_json(200, status_snapshot())
+            return
+        if parsed.path == "/metrics":
+            self.send_text(200, prometheus_metrics(), "text/plain; version=0.0.4; charset=utf-8")
             return
         if parsed.path == "/models":
             self.send_json(
@@ -1241,16 +1559,19 @@ function escapeHtml(value) {
             self.send_json(404, {"error": "не найдено"})
             return
 
-        params = parse_qs(parsed.query)
-        query = (params.get("q") or params.get("query") or [""])[0]
-        model_key = normalize_model_key((params.get("model") or [DEFAULT_MODEL])[0])
-        search_mode = normalize_search_mode((params.get("mode") or [DEFAULT_SEARCH_MODE])[0])
-        topk = int((params.get("topk") or ["5"])[0])
-        rerank_pool = int((params.get("rerank_pool") or ["50"])[0])
-        snippet = int((params.get("snippet") or ["220"])[0])
-        use_cache = (params.get("no_cache") or ["0"])[0] not in ("1", "true", "yes")
-
+        request_id = uuid.uuid4().hex
+        started = time.perf_counter()
+        model_key = "unknown"
+        search_mode = "unknown"
         try:
+            params = parse_qs(parsed.query)
+            query = (params.get("q") or params.get("query") or [""])[0]
+            model_key = normalize_model_key((params.get("model") or [DEFAULT_MODEL])[0])
+            search_mode = normalize_search_mode((params.get("mode") or [DEFAULT_SEARCH_MODE])[0])
+            topk = int((params.get("topk") or ["5"])[0])
+            rerank_pool = int((params.get("rerank_pool") or ["50"])[0])
+            snippet = int((params.get("snippet") or ["220"])[0])
+            use_cache = (params.get("no_cache") or ["0"])[0] not in ("1", "true", "yes")
             options = make_search_options(
                 semantic_weight=(
                     float(params["semantic_weight"][0]) if params.get("semantic_weight") else None
@@ -1296,9 +1617,32 @@ function escapeHtml(value) {
                         {**item, "text": str(item.get("text", ""))[:snippet]} for item in results
                     ],
                 },
+                {"X-Request-Id": request_id},
+            )
+            duration = time.perf_counter() - started
+            _METRICS.record_search(model_key, search_mode, "success", duration)
+            log_event(
+                "search_completed",
+                request_id=request_id,
+                model=model_key,
+                mode=search_mode,
+                duration_seconds=round(duration, 6),
+                result_count=len(results),
+                cache_enabled=use_cache,
             )
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            duration = time.perf_counter() - started
+            _METRICS.record_search(model_key, search_mode, "error", duration)
+            log_event(
+                "search_failed",
+                level="error",
+                request_id=request_id,
+                model=model_key,
+                mode=search_mode,
+                duration_seconds=round(duration, 6),
+                error_type=type(exc).__name__,
+            )
+            self.send_json(500, {"error": str(exc)}, {"X-Request-Id": request_id})
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -1309,6 +1653,8 @@ function escapeHtml(value) {
             self.send_json(401, {"error": "нет авторизации"})
             return
 
+        started = time.perf_counter()
+        request_id = uuid.uuid4().hex
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
@@ -1332,9 +1678,47 @@ function escapeHtml(value) {
                 )
             finally:
                 archive_path.unlink(missing_ok=True)
-            self.send_json(200, payload)
+            duration = time.perf_counter() - started
+            _METRICS.record_sync("success", duration)
+            with _STATE_LOCK:
+                _SERVICE_STATE.update({
+                    "last_sync_at": datetime.now(timezone.utc).isoformat(),
+                    "last_sync_status": "success",
+                    "last_sync_duration_seconds": round(duration, 3),
+                    "last_sync_error": "",
+                    "active_db_root": payload["active_db_root"],
+                })
+                for model_key, model in payload["models"].items():
+                    model_state = _SERVICE_STATE["models"].setdefault(model_key, {})
+                    model_state["doc_count"] = int(model["doc_count"])
+            log_event(
+                "sync_completed",
+                request_id=request_id,
+                duration_seconds=round(duration, 3),
+                active_db_root=payload["active_db_root"],
+                deleted_versions=len(payload["cleanup"]["deleted"]),
+                skipped_versions=len(payload["cleanup"]["skipped"]),
+            )
+            self.send_json(200, payload, {"X-Request-Id": request_id})
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            duration = time.perf_counter() - started
+            _METRICS.record_sync("error", duration)
+            with _STATE_LOCK:
+                _SERVICE_STATE.update({
+                    "last_sync_at": datetime.now(timezone.utc).isoformat(),
+                    "last_sync_status": "error",
+                    "last_sync_duration_seconds": round(duration, 3),
+                    "last_sync_error": str(exc),
+                })
+            log_event(
+                "sync_failed",
+                level="error",
+                request_id=request_id,
+                duration_seconds=round(duration, 3),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            self.send_json(500, {"error": str(exc)}, {"X-Request-Id": request_id})
 
 
 def command_serve(args: argparse.Namespace) -> None:
@@ -1352,12 +1736,46 @@ def command_serve(args: argparse.Namespace) -> None:
         except Exception:
             collection, _ = build_index(Path(args.okf).resolve(), db_dir, model_key)
             collections[model_key] = collection
-        get_model(model_key)
     _SEARCH_COLLECTIONS = collections
+
+    preload_value = os.environ.get("OKF_ZVEC_PRELOAD_MODELS", "").strip().casefold()
+    if preload_value in ("1", "true", "yes", "all"):
+        preload_models = list(MODEL_CONFIGS)
+    else:
+        preload_models = [
+            normalize_model_key(value.strip())
+            for value in preload_value.split(",")
+            if value.strip()
+        ]
+    for model_key in preload_models:
+        get_model(model_key)
+
+    with _STATE_LOCK:
+        _SERVICE_STATE["active_db_root"] = str(active_db_root)
+        if active_db_root.exists():
+            _SERVICE_STATE["last_sync_at"] = datetime.fromtimestamp(
+                active_db_root.stat().st_mtime,
+                tz=timezone.utc,
+            ).isoformat()
+            _SERVICE_STATE["last_sync_status"] = "loaded"
+        for model_key, collection in collections.items():
+            _SERVICE_STATE["models"][model_key] = {
+                "name": MODEL_CONFIGS[model_key]["name"],
+                "loaded": model_key in _MODELS,
+                "doc_count": collection_doc_count(collection),
+                "load_seconds": _METRICS.model_load_seconds.get(model_key, 0.0),
+            }
+
     server = ThreadingHTTPServer((args.host, args.port), SearchHandler)
     server.okf_dir = Path(args.okf).resolve()
     server.db_dir = db_root
-    print(f"Сервис поиска OKF zvec доступен по адресу http://{args.host}:{args.port}", flush=True)
+    log_event(
+        "service_started",
+        address=f"http://{args.host}:{args.port}",
+        active_db_root=str(active_db_root),
+        search_auth_enabled=bool(search_token()),
+        preloaded_models=preload_models,
+    )
     server.serve_forever()
 
 
@@ -1398,6 +1816,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser = subparsers.add_parser("benchmark", help="сравнить качество режимов поиска")
     benchmark_parser.add_argument("--file", default="benchmarks/queries.json")
     benchmark_parser.add_argument("--service-url", help="HTTP-адрес запущенного сервиса")
+    benchmark_parser.add_argument("--token-file", help="файл токена поискового API")
     benchmark_parser.add_argument("--model", default=DEFAULT_MODEL, choices=list(MODEL_CONFIGS.keys()))
     benchmark_parser.add_argument("--modes", default="semantic,fts,hybrid")
     benchmark_parser.add_argument("--topk", type=int, default=5)

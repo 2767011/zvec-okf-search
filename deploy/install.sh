@@ -29,9 +29,12 @@ python3 -m venv "${APP_HOME}/.venv"
 if [[ ! -s "${APP_HOME}/config/service-token" ]]; then
   openssl rand -hex 32 > "${APP_HOME}/config/service-token"
   chmod 0600 "${APP_HOME}/config/service-token"
-  echo "Токен синхронизации (сохраните его в защищённом месте):"
-  cat "${APP_HOME}/config/service-token"
 fi
+if [[ ! -s "${APP_HOME}/config/search-token" ]]; then
+  openssl rand -hex 32 > "${APP_HOME}/config/search-token"
+  chmod 0600 "${APP_HOME}/config/search-token"
+fi
+echo "Токены сохранены в ${APP_HOME}/config/."
 
 OKF_ZVEC_HOME="${APP_HOME}" "${APP_HOME}/.venv/bin/python" - <<'PY'
 from sentence_transformers import SentenceTransformer
