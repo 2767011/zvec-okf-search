@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=-/etc/okf-zvec-search.env
 Environment=OKF_ZVEC_HOME=/opt/okf-zvec-search
+Environment=OKF_ZVEC_KEEP_VERSIONS=3
 WorkingDirectory=/opt/okf-zvec-search
 ExecStart=/opt/okf-zvec-search/.venv/bin/python /opt/okf-zvec-search/app/okf_zvec.py serve --host 0.0.0.0 --port 8765
 Restart=on-failure

@@ -89,8 +89,13 @@ okf-zvec serve --okf ./examples/okf --host 0.0.0.0 --port 8765
 OKF_ZVEC_HOME
 OKF_ZVEC_TOKEN_FILE
 OKF_ZVEC_ACTIVE_DB_FILE
+OKF_ZVEC_KEEP_VERSIONS
 HF_TOKEN
 ```
+
+`OKF_ZVEC_KEEP_VERSIONS` задаёт число сохраняемых версий индекса и по умолчанию
+равно `3`. Новая версия становится активной только после успешной сборки всех
+моделей. При ошибке сервис продолжает использовать прежние OKF и индекс.
 
 ## Безопасность
 

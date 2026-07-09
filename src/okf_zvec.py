@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import threading
 import tempfile
 import gc
 import time
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -64,6 +66,7 @@ _ACTIVE_DB_FILE = Path(
 )
 _MORPH: Any | None = None
 _MORPH_UNAVAILABLE = False
+DEFAULT_KEEP_VERSIONS = 3
 
 
 def normalize_model_key(model_key: str | None) -> str:
@@ -504,44 +507,150 @@ def read_active_db_root(default_db_root: Path) -> Path:
 
 def write_active_db_root(db_root: Path) -> None:
     _ACTIVE_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _ACTIVE_DB_FILE.write_text(str(db_root.resolve()), encoding="utf-8")
+    temporary = _ACTIVE_DB_FILE.with_name(f".{_ACTIVE_DB_FILE.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(str(db_root.resolve()), encoding="utf-8")
+    os.replace(temporary, _ACTIVE_DB_FILE)
+
+
+def keep_versions() -> int:
+    raw_value = os.environ.get("OKF_ZVEC_KEEP_VERSIONS", str(DEFAULT_KEEP_VERSIONS))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("OKF_ZVEC_KEEP_VERSIONS должно быть целым числом") from exc
+    if value < 1:
+        raise ValueError("OKF_ZVEC_KEEP_VERSIONS должно быть не меньше 1")
+    return value
+
+
+def cleanup_db_versions(db_root: Path, active_db_root: Path, keep: int) -> dict[str, list[str]]:
+    candidates = [
+        path
+        for path in db_root.parent.glob(f"{db_root.name}-*")
+        if path.is_dir()
+    ]
+    candidates.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+
+    retained = {active_db_root.resolve()}
+    for path in candidates:
+        if len(retained) >= keep:
+            break
+        retained.add(path.resolve())
+
+    deleted: list[str] = []
+    skipped: list[str] = []
+    for path in candidates:
+        if path.resolve() in retained:
+            continue
+        try:
+            shutil.rmtree(path)
+            deleted.append(str(path))
+        except OSError:
+            skipped.append(str(path))
+    return {"deleted": deleted, "skipped": skipped}
+
+
+def stage_okf_directory(uploaded_okf: Path, okf_dir: Path, version: str) -> Path:
+    staged = okf_dir.parent / f".{okf_dir.name}.staging-{version}"
+    if staged.exists():
+        shutil.rmtree(staged)
+    shutil.copytree(uploaded_okf, staged)
+    return staged
+
+
+def activate_staged_okf(staged_okf: Path, okf_dir: Path, version: str) -> Path | None:
+    backup = okf_dir.parent / f".{okf_dir.name}.backup-{version}"
+    if backup.exists():
+        shutil.rmtree(backup)
+    if okf_dir.exists():
+        os.replace(okf_dir, backup)
+    else:
+        backup = None
+    try:
+        os.replace(staged_okf, okf_dir)
+    except Exception:
+        if backup is not None:
+            os.replace(backup, okf_dir)
+        raise
+    return backup
+
+
+def rollback_okf_activation(okf_dir: Path, backup: Path | None) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(okf_dir)
+    if backup is not None and backup.exists():
+        os.replace(backup, okf_dir)
 
 
 def sync_okf_from_archive(archive: Path, okf_dir: Path, db_root: Path) -> dict[str, Any]:
     global _SEARCH_COLLECTIONS
 
     with _SEARCH_LOCK:
+        version = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        staged_okf: Path | None = None
+        next_db_root = db_root.parent / f"{db_root.name}-{version}"
+        built: dict[str, Any] = {}
+        response_models: dict[str, Any] = {}
+
         with tempfile.TemporaryDirectory(prefix="okf-sync-") as tmp:
             tmp_path = Path(tmp)
             safe_extract_tar(archive, tmp_path)
             uploaded_okf = tmp_path / "okf"
             if not uploaded_okf.is_dir():
                 raise ValueError("загруженный архив должен содержать каталог okf")
+            staged_okf = stage_okf_directory(uploaded_okf, okf_dir, version)
 
-            if okf_dir.exists():
-                shutil.rmtree(okf_dir)
-            shutil.move(str(uploaded_okf), str(okf_dir))
+        try:
+            for model_key in MODEL_CONFIGS:
+                collection, doc_count = build_index(
+                    staged_okf,
+                    model_db_dir(next_db_root, model_key),
+                    model_key,
+                )
+                built[model_key] = collection
+                response_models[model_key] = {
+                    "doc_count": doc_count,
+                    "stats": str(collection.stats),
+                    "name": MODEL_CONFIGS[model_key]["name"],
+                }
+        except Exception:
+            built.clear()
+            gc.collect()
+            shutil.rmtree(next_db_root, ignore_errors=True)
+            shutil.rmtree(staged_okf, ignore_errors=True)
+            raise
 
         old_collections = _SEARCH_COLLECTIONS
-        _SEARCH_COLLECTIONS = {}
+        old_active_db_root = read_active_db_root(db_root)
+        backup_okf: Path | None = None
+        try:
+            backup_okf = activate_staged_okf(staged_okf, okf_dir, version)
+            write_active_db_root(next_db_root)
+        except Exception:
+            if backup_okf is not None:
+                rollback_okf_activation(okf_dir, backup_okf)
+            built.clear()
+            gc.collect()
+            shutil.rmtree(next_db_root, ignore_errors=True)
+            shutil.rmtree(staged_okf, ignore_errors=True)
+            with contextlib.suppress(Exception):
+                write_active_db_root(old_active_db_root)
+            raise
+
+        _SEARCH_COLLECTIONS = built
         _QUERY_CACHE.clear()
-        gc.collect()
-        built: dict[str, Any] = {}
-        response_models: dict[str, Any] = {}
-        next_db_root = db_root.parent / f"{db_root.name}-{int(time.time())}"
-        for model_key in MODEL_CONFIGS:
-            collection, doc_count = build_index(okf_dir, model_db_dir(next_db_root, model_key), model_key)
-            built[model_key] = collection
-            response_models[model_key] = {
-                "doc_count": doc_count,
-                "stats": str(collection.stats),
-                "name": MODEL_CONFIGS[model_key]["name"],
-            }
         old_collections.clear()
         gc.collect()
-        _SEARCH_COLLECTIONS = built
-        write_active_db_root(next_db_root)
-        return {"ok": True, "models": response_models}
+        if backup_okf is not None:
+            shutil.rmtree(backup_okf, ignore_errors=True)
+
+        cleanup = cleanup_db_versions(db_root, next_db_root, keep_versions())
+        return {
+            "ok": True,
+            "active_db_root": str(next_db_root),
+            "models": response_models,
+            "cleanup": cleanup,
+        }
 
 
 def command_index(args: argparse.Namespace) -> None:
