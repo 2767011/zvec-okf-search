@@ -1584,6 +1584,9 @@ function escapeHtml(value) {
     th, td {{ text-align: left; padding: 10px; border: 1px solid #e2e8f0; }}
     dl {{ display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; }}
     dt {{ color: #64748b; }}
+    .model-settings {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+    .model-actions {{ display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; }}
+    .action-status {{ color: #64748b; min-height: 24px; margin-top: 8px; }}
   </style>
 </head>
 <body>
@@ -1601,22 +1604,63 @@ function escapeHtml(value) {
     <dt>Авторизация поиска</dt><dd>{'включена' if state['search_auth_enabled'] else 'отключена'}</dd>
   </dl>
   <h2>Предзагрузка моделей</h2>
-  <form method="post" action="/settings">
+  <form id="preloadForm" class="model-settings">
     <select name="preload_models">{preload_options}</select>
-    <button type="submit">Применить</button>
+    <a href="#" data-action="apply">Применить</a>
   </form>
-  <form method="post" action="/actions/reload-models">
-    <button type="submit">Перезагрузить выбранные модели</button>
-  </form>
-  <form method="post" action="/actions/restart">
-    <button type="submit">Перезапустить сервис</button>
-  </form>
+  <nav class="model-actions">
+    <a href="#" data-action="reload">Перезагрузить выбранные модели</a>
+    <a href="#" data-action="restart">Перезапустить сервис</a>
+  </nav>
+  <div id="actionStatus" class="action-status"></div>
   <h2>Модели и индексы</h2>
   <table>
     <thead><tr><th>Ключ</th><th>Модель</th><th>В памяти</th><th>Фрагментов</th></tr></thead>
     <tbody>{''.join(model_rows)}</tbody>
   </table>
 </main>
+<script>
+const actionStatus = document.getElementById('actionStatus');
+const preloadForm = document.getElementById('preloadForm');
+
+async function postAction(path, body) {{
+  actionStatus.textContent = 'Выполняется...';
+  const response = await fetch(path, {{
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: body ? {{'Content-Type': 'application/x-www-form-urlencoded'}} : {{}},
+    body,
+  }});
+  if (!response.ok && response.status !== 202) {{
+    const payload = await response.json().catch(() => ({{}}));
+    throw new Error(payload.error || `HTTP ${{response.status}}`);
+  }}
+  return response;
+}}
+
+document.querySelectorAll('[data-action]').forEach((link) => {{
+  link.addEventListener('click', async (event) => {{
+    event.preventDefault();
+    try {{
+      const action = link.dataset.action;
+      if (action === 'apply') {{
+        const body = new URLSearchParams(new FormData(preloadForm));
+        await postAction('/settings', body);
+        window.location.reload();
+      }} else if (action === 'reload') {{
+        await postAction('/actions/reload-models');
+        window.location.reload();
+      }} else {{
+        await postAction('/actions/restart');
+        actionStatus.textContent = 'Сервис перезапускается...';
+        setTimeout(() => window.location.reload(), 12000);
+      }}
+    }} catch (error) {{
+      actionStatus.textContent = `Ошибка: ${{error.message}}`;
+    }}
+  }});
+}});
+</script>
 </body>
 </html>"""
 

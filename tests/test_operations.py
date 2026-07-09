@@ -115,6 +115,14 @@ class OperationsTests(unittest.TestCase):
             self.assertEqual(restored, "e5")
             self.assertEqual(restored_models, ["e5"])
 
+    def test_status_actions_are_rendered_as_links(self):
+        page = okf_zvec.SearchHandler.render_status(None)
+
+        self.assertIn('data-action="apply"', page)
+        self.assertIn('data-action="reload"', page)
+        self.assertIn('data-action="restart"', page)
+        self.assertNotIn("<button", page)
+
 
 if __name__ == "__main__":
     unittest.main()
