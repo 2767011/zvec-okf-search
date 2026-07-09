@@ -8,6 +8,7 @@ service-token
 search-token
 config/service-token
 config/search-token
+config/runtime-settings.json
 data/
 *.tgz
 *.tar.gz

@@ -103,6 +103,18 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(payload["result_count"], 3)
         self.assertNotIn("query", payload)
 
+    def test_web_preload_setting_is_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_file = Path(tmp) / "runtime-settings.json"
+            with mock.patch.object(okf_zvec, "_RUNTIME_SETTINGS_FILE", settings_file):
+                canonical, models = okf_zvec.save_preload_setting("e5")
+                restored, restored_models = okf_zvec.configured_preload_setting()
+
+            self.assertEqual(canonical, "e5")
+            self.assertEqual(models, ["e5"])
+            self.assertEqual(restored, "e5")
+            self.assertEqual(restored_models, ["e5"])
+
 
 if __name__ == "__main__":
     unittest.main()

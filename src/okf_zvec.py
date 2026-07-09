@@ -73,6 +73,12 @@ _SEARCH_TOKEN_FILE = Path(
 _ACTIVE_DB_FILE = Path(
     os.environ.get("OKF_ZVEC_ACTIVE_DB_FILE", str(APP_HOME / "data" / "active-db-root"))
 )
+_RUNTIME_SETTINGS_FILE = Path(
+    os.environ.get(
+        "OKF_ZVEC_RUNTIME_SETTINGS_FILE",
+        str(APP_HOME / "config" / "runtime-settings.json"),
+    )
+)
 _MORPH: Any | None = None
 _MORPH_UNAVAILABLE = False
 DEFAULT_KEEP_VERSIONS = 3
@@ -146,6 +152,73 @@ _SERVICE_STATE: dict[str, Any] = {
     "active_db_root": "",
     "models": {},
 }
+
+
+def normalize_preload_setting(value: str) -> tuple[str, list[str]]:
+    normalized = value.strip().casefold()
+    if normalized in ("", "none"):
+        return "none", []
+    if normalized in ("1", "true", "yes", "all"):
+        return "all", list(MODEL_CONFIGS)
+    models = [normalize_model_key(item.strip()) for item in normalized.split(",") if item.strip()]
+    canonical = ",".join(models)
+    return canonical, models
+
+
+def configured_preload_setting() -> tuple[str, list[str]]:
+    try:
+        payload = json.loads(_RUNTIME_SETTINGS_FILE.read_text(encoding="utf-8"))
+        value = str(payload.get("preload_models", ""))
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        value = os.environ.get("OKF_ZVEC_PRELOAD_MODELS", "")
+    return normalize_preload_setting(value)
+
+
+def save_preload_setting(value: str) -> tuple[str, list[str]]:
+    canonical, models = normalize_preload_setting(value)
+    _RUNTIME_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _RUNTIME_SETTINGS_FILE.with_name(
+        f".{_RUNTIME_SETTINGS_FILE.name}.{uuid.uuid4().hex}.tmp"
+    )
+    temporary.write_text(
+        json.dumps({"preload_models": canonical}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, _RUNTIME_SETTINGS_FILE)
+    return canonical, models
+
+
+def apply_preload_setting(value: str, unload_others: bool = True) -> tuple[str, list[str]]:
+    canonical, models = normalize_preload_setting(value)
+    with _SEARCH_LOCK:
+        for model_key in models:
+            get_model(model_key)
+        if unload_others:
+            for model_key in list(_MODELS):
+                if model_key not in models:
+                    _MODELS.pop(model_key, None)
+            gc.collect()
+        with _STATE_LOCK:
+            for model_key in MODEL_CONFIGS:
+                state = _SERVICE_STATE["models"].setdefault(
+                    model_key,
+                    {"name": MODEL_CONFIGS[model_key]["name"]},
+                )
+                state["loaded"] = model_key in _MODELS
+    log_event("preload_setting_applied", value=canonical, loaded_models=sorted(_MODELS))
+    return canonical, models
+
+
+def reload_preloaded_models() -> tuple[str, list[str]]:
+    canonical, models = configured_preload_setting()
+    with _SEARCH_LOCK:
+        for model_key in models:
+            _MODELS.pop(model_key, None)
+        gc.collect()
+        for model_key in models:
+            get_model(model_key)
+    log_event("preloaded_models_reloaded", value=canonical, loaded_models=sorted(_MODELS))
+    return canonical, models
 
 
 @dataclass(frozen=True)
@@ -831,6 +904,7 @@ def collection_doc_count(collection: Any) -> int:
 def status_snapshot() -> dict[str, Any]:
     with _STATE_LOCK:
         state = json.loads(json.dumps(_SERVICE_STATE, default=str))
+    preload_setting, _ = configured_preload_setting()
     state.update({
         "uptime_seconds": round(time.time() - SERVICE_STARTED_AT, 1),
         "cache_entries": len(_QUERY_CACHE),
@@ -838,6 +912,7 @@ def status_snapshot() -> dict[str, Any]:
         "loaded_models": sorted(_MODELS),
         "retained_versions": keep_versions(),
         "search_auth_enabled": bool(search_token()),
+        "preload_models": preload_setting,
     })
     return state
 
@@ -1315,6 +1390,13 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_redirect(self, location: str) -> None:
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
     def send_search_unauthorized(self, wants_json: bool = False) -> None:
         headers = {"WWW-Authenticate": 'Basic realm="OKF Zvec Search", charset="UTF-8"'}
         if wants_json:
@@ -1477,6 +1559,18 @@ function escapeHtml(value) {
                 f"<td>{int(model_state.get('doc_count', 0))}</td>"
                 "</tr>"
             )
+        preload_choices = (
+            ("none", "Не загружать заранее"),
+            ("e5", "E5"),
+            ("paraphrase", "Paraphrase MiniLM"),
+            ("all", "Обе модели"),
+        )
+        preload_options = "".join(
+            f'<option value="{value}"'
+            f'{" selected" if state["preload_models"] == value else ""}>'
+            f"{label}</option>"
+            for value, label in preload_choices
+        )
         return f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -1506,6 +1600,17 @@ function escapeHtml(value) {
     <dt>Время работы</dt><dd>{float(state['uptime_seconds']):.1f} с</dd>
     <dt>Авторизация поиска</dt><dd>{'включена' if state['search_auth_enabled'] else 'отключена'}</dd>
   </dl>
+  <h2>Предзагрузка моделей</h2>
+  <form method="post" action="/settings">
+    <select name="preload_models">{preload_options}</select>
+    <button type="submit">Применить</button>
+  </form>
+  <form method="post" action="/actions/reload-models">
+    <button type="submit">Перезагрузить выбранные модели</button>
+  </form>
+  <form method="post" action="/actions/restart">
+    <button type="submit">Перезапустить сервис</button>
+  </form>
   <h2>Модели и индексы</h2>
   <table>
     <thead><tr><th>Ключ</th><th>Модель</th><th>В памяти</th><th>Фрагментов</th></tr></thead>
@@ -1646,6 +1751,42 @@ function escapeHtml(value) {
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path in ("/settings", "/actions/reload-models", "/actions/restart"):
+            if not is_search_authorized(self.headers):
+                self.send_search_unauthorized(wants_json=False)
+                return
+            try:
+                if parsed.path == "/settings":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(length).decode("utf-8")
+                    params = parse_qs(body)
+                    value = (params.get("preload_models") or ["none"])[0]
+                    canonical, _ = save_preload_setting(value)
+                    apply_preload_setting(canonical)
+                    self.send_redirect("/status")
+                    return
+                if parsed.path == "/actions/reload-models":
+                    reload_preloaded_models()
+                    self.send_redirect("/status")
+                    return
+
+                log_event("service_restart_requested")
+                self.send_html(
+                    202,
+                    "<h1>Сервис перезапускается</h1><p>Обновите страницу через несколько секунд.</p>",
+                )
+                threading.Timer(0.25, lambda: os._exit(75)).start()
+                return
+            except Exception as exc:
+                log_event(
+                    "settings_action_failed",
+                    level="error",
+                    action=parsed.path,
+                    error_type=type(exc).__name__,
+                )
+                self.send_json(500, {"error": str(exc)})
+                return
+
         if parsed.path != "/sync":
             self.send_json(404, {"error": "не найдено"})
             return
@@ -1738,15 +1879,7 @@ def command_serve(args: argparse.Namespace) -> None:
             collections[model_key] = collection
     _SEARCH_COLLECTIONS = collections
 
-    preload_value = os.environ.get("OKF_ZVEC_PRELOAD_MODELS", "").strip().casefold()
-    if preload_value in ("1", "true", "yes", "all"):
-        preload_models = list(MODEL_CONFIGS)
-    else:
-        preload_models = [
-            normalize_model_key(value.strip())
-            for value in preload_value.split(",")
-            if value.strip()
-        ]
+    preload_value, preload_models = configured_preload_setting()
     for model_key in preload_models:
         get_model(model_key)
 
@@ -1774,6 +1907,7 @@ def command_serve(args: argparse.Namespace) -> None:
         address=f"http://{args.host}:{args.port}",
         active_db_root=str(active_db_root),
         search_auth_enabled=bool(search_token()),
+        preload_setting=preload_value,
         preloaded_models=preload_models,
     )
     server.serve_forever()
