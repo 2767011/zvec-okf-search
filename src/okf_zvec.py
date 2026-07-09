@@ -551,6 +551,7 @@ def search_collection(
     model_key: str = DEFAULT_MODEL,
     search_mode: str = DEFAULT_SEARCH_MODE,
     options: SearchOptions | None = None,
+    use_cache: bool = True,
 ) -> list[dict[str, Any]]:
     if not query:
         raise ValueError("для поиска нужен непустой запрос")
@@ -567,9 +568,10 @@ def search_collection(
         rerank_pool,
         options,
     )
-    cached = _QUERY_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    if use_cache:
+        cached = _QUERY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
     pool_size = max(topk, rerank_pool)
     semantic_results: list[Any] = []
@@ -657,9 +659,10 @@ def search_collection(
         )
         if len(output) >= topk:
             break
-    if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
-        _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)))
-    _QUERY_CACHE[cache_key] = output
+    if use_cache:
+        if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
+            _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)))
+        _QUERY_CACHE[cache_key] = output
     return output
 
 
@@ -962,6 +965,7 @@ def benchmark_http_search(
         "semantic_weight": options.semantic_weight,
         "fts_weight": options.fts_weight,
         "min_relevance": options.min_relevance,
+        "no_cache": 1,
     })
     with urlopen(f"{service_url.rstrip('/')}/search?{params}", timeout=30) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -1244,6 +1248,7 @@ function escapeHtml(value) {
         topk = int((params.get("topk") or ["5"])[0])
         rerank_pool = int((params.get("rerank_pool") or ["50"])[0])
         snippet = int((params.get("snippet") or ["220"])[0])
+        use_cache = (params.get("no_cache") or ["0"])[0] not in ("1", "true", "yes")
 
         try:
             options = make_search_options(
@@ -1272,6 +1277,7 @@ function escapeHtml(value) {
                 model_key,
                 search_mode,
                 options,
+                use_cache,
             )
             self.send_json(
                 200,
