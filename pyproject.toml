@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "okf-zvec-search"
+version = "0.1.0"
+description = "Семантический, полнотекстовый и гибридный поиск по OKF Markdown"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "zvec>=0.5.1,<0.6",
+  "sentence-transformers>=5.6,<6",
+  "pymorphy3>=2.0,<3",
+  "pymorphy3-dicts-ru>=2.4",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.12"]
+
+[project.scripts]
+okf-zvec = "okf_zvec:main"
+
+[tool.setuptools]
+py-modules = ["okf_zvec"]
+package-dir = { "" = "src" }
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"

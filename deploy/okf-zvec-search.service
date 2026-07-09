@@ -1,0 +1,18 @@
+[Unit]
+Description=Сервис поиска OKF Zvec
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/okf-zvec-search.env
+Environment=OKF_ZVEC_HOME=/opt/okf-zvec-search
+WorkingDirectory=/opt/okf-zvec-search
+ExecStart=/opt/okf-zvec-search/.venv/bin/python /opt/okf-zvec-search/app/okf_zvec.py serve --host 0.0.0.0 --port 8765
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

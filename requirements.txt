@@ -1,0 +1,4 @@
+zvec>=0.5.1,<0.6
+sentence-transformers>=5.6,<6
+pymorphy3>=2.0,<3
+pymorphy3-dicts-ru>=2.4

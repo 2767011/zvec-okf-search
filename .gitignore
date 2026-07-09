@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+service-token
+config/service-token
+data/
+*.tgz
+*.tar.gz
+*.log
