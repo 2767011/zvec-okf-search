@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import fnmatch
 import hashlib
 import json
 import os
@@ -18,13 +19,16 @@ import tempfile
 import gc
 import time
 import uuid
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import urlopen
 
 import zvec
+import yaml
 
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -56,7 +60,7 @@ TOKEN_RE = re.compile(r"[\wА-Яа-яЁё-]+", re.UNICODE)
 _MODELS: dict[str, Any] = {}
 _SEARCH_COLLECTIONS: dict[str, Any] = {}
 _SEARCH_LOCK = threading.Lock()
-_QUERY_CACHE: dict[tuple[str, str, str, int], list[dict[str, Any]]] = {}
+_QUERY_CACHE: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
 _QUERY_CACHE_MAX = 256
 _SERVICE_TOKEN_FILE = Path(
     os.environ.get("OKF_ZVEC_TOKEN_FILE", str(APP_HOME / "config" / "service-token"))
@@ -67,6 +71,84 @@ _ACTIVE_DB_FILE = Path(
 _MORPH: Any | None = None
 _MORPH_UNAVAILABLE = False
 DEFAULT_KEEP_VERSIONS = 3
+DEFAULT_SEMANTIC_WEIGHT = 1.0
+DEFAULT_FTS_WEIGHT = 1.0
+DEFAULT_MIN_RELEVANCE = 0.25
+RRF_RANK_CONSTANT = 60
+
+
+@dataclass(frozen=True)
+class SearchOptions:
+    semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT
+    fts_weight: float = DEFAULT_FTS_WEIGHT
+    min_relevance: float = DEFAULT_MIN_RELEVANCE
+    doc_type: str = ""
+    tags: tuple[str, ...] = ()
+    path_pattern: str = ""
+    project: str = ""
+    date_from: str = ""
+    date_to: str = ""
+
+    def validate(self) -> None:
+        if self.semantic_weight < 0 or self.fts_weight < 0:
+            raise ValueError("веса поиска не могут быть отрицательными")
+        if self.semantic_weight + self.fts_weight <= 0:
+            raise ValueError("хотя бы один вес поиска должен быть больше нуля")
+        if not 0 <= self.min_relevance <= 1:
+            raise ValueError("порог релевантности должен быть от 0 до 1")
+
+
+def env_float(name: str, default: float) -> float:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} должно быть числом") from exc
+
+
+def split_filter_tags(value: str | None) -> tuple[str, ...]:
+    return tuple(tag.strip() for tag in (value or "").split(",") if tag.strip())
+
+
+def make_search_options(
+    *,
+    semantic_weight: float | None = None,
+    fts_weight: float | None = None,
+    min_relevance: float | None = None,
+    doc_type: str = "",
+    tags: str = "",
+    path_pattern: str = "",
+    project: str = "",
+    date_from: str = "",
+    date_to: str = "",
+) -> SearchOptions:
+    options = SearchOptions(
+        semantic_weight=(
+            semantic_weight
+            if semantic_weight is not None
+            else env_float("OKF_ZVEC_SEMANTIC_WEIGHT", DEFAULT_SEMANTIC_WEIGHT)
+        ),
+        fts_weight=(
+            fts_weight
+            if fts_weight is not None
+            else env_float("OKF_ZVEC_FTS_WEIGHT", DEFAULT_FTS_WEIGHT)
+        ),
+        min_relevance=(
+            min_relevance
+            if min_relevance is not None
+            else env_float("OKF_ZVEC_MIN_RELEVANCE", DEFAULT_MIN_RELEVANCE)
+        ),
+        doc_type=doc_type.strip(),
+        tags=split_filter_tags(tags),
+        path_pattern=path_pattern.strip(),
+        project=project.strip(),
+        date_from=date_from.strip(),
+        date_to=date_to.strip(),
+    )
+    options.validate()
+    return options
 
 
 def normalize_model_key(model_key: str | None) -> str:
@@ -136,18 +218,27 @@ def embed_many(texts: list[str], model_key: str = DEFAULT_MODEL, kind: str = "pa
     return [vector.astype("float32").tolist() for vector in vectors]
 
 
-def split_frontmatter(text: str) -> tuple[dict[str, str], str]:
+def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     match = FRONTMATTER_RE.match(text)
     if not match:
         return {}, text
 
-    meta: dict[str, str] = {}
-    for line in match.group(1).splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        meta[key.strip()] = value.strip().strip('"').strip("'")
+    loaded = yaml.safe_load(match.group(1)) or {}
+    meta = loaded if isinstance(loaded, dict) else {}
     return meta, text[match.end() :]
+
+
+def metadata_text(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def metadata_tags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [metadata_text(item) for item in value if metadata_text(item)]
+    if isinstance(value, str):
+        stripped = value.strip().strip("[]")
+        return [item.strip().strip("'\"") for item in stripped.split(",") if item.strip()]
+    return []
 
 
 def title_from_markdown(body: str, fallback: str) -> str:
@@ -209,46 +300,53 @@ def section_chunks(body: str) -> list[tuple[str, str]]:
 
 
 def iter_docs(okf_dir: Path, model_key: str = DEFAULT_MODEL) -> list[zvec.Doc]:
-    items: list[tuple[str, str, str, str, str, str, str, str, str]] = []
+    items: list[dict[str, Any]] = []
     for path in sorted(okf_dir.rglob("*.md")):
         rel = path.relative_to(okf_dir).as_posix()
         text = path.read_text(encoding="utf-8")
         meta, body = split_frontmatter(text)
-        title = meta.get("title") or title_from_markdown(body, rel)
-        doc_type = meta.get("type", "")
+        title = metadata_text(meta.get("title")) or title_from_markdown(body, rel)
+        doc_type = metadata_text(meta.get("type"))
+        tags = metadata_tags(meta.get("tags"))
+        project = metadata_text(meta.get("project"))
+        timestamp = metadata_text(meta.get("timestamp"))
         for chunk_index, (heading, chunk) in enumerate(section_chunks(body)):
             safe_id = "doc_" + hashlib.sha1(f"{rel}#{chunk_index}".encode("utf-8")).hexdigest()
-            search_text = f"{title}\n{doc_type}\n{heading}\n{chunk}"
-            items.append(
-                (
-                    safe_id,
-                    rel,
-                    str(chunk_index),
-                    title,
-                    doc_type,
-                    heading,
-                    chunk,
-                    search_text,
-                    normalize_fts_text(search_text),
-                )
-            )
+            search_text = f"{title}\n{doc_type}\n{' '.join(tags)}\n{project}\n{heading}\n{chunk}"
+            items.append({
+                "id": safe_id,
+                "path": rel,
+                "chunk": str(chunk_index),
+                "title": title,
+                "type": doc_type,
+                "tags": tags,
+                "project": project,
+                "timestamp": timestamp,
+                "heading": heading,
+                "text": chunk,
+                "search_text": search_text,
+                "fts_text": normalize_fts_text(search_text),
+            })
 
     docs: list[zvec.Doc] = []
-    for (safe_id, rel, chunk_index, title, doc_type, heading, chunk, search_text, fts_text), vector in zip(
-        items, embed_many([item[7] for item in items], model_key, kind="passage"), strict=True
+    for item, vector in zip(
+        items, embed_many([item["search_text"] for item in items], model_key, kind="passage"), strict=True
     ):
         docs.append(
             zvec.Doc(
-                id=safe_id,
+                id=item["id"],
                 vectors={"embedding": vector},
                 fields={
-                    "path": rel,
-                    "chunk": chunk_index,
-                    "heading": heading,
-                    "title": title,
-                    "type": doc_type,
-                    "text": chunk,
-                    "search_text": fts_text,
+                    "path": item["path"],
+                    "chunk": item["chunk"],
+                    "heading": item["heading"],
+                    "title": item["title"],
+                    "type": item["type"],
+                    "tags": item["tags"],
+                    "project": item["project"],
+                    "timestamp": item["timestamp"],
+                    "text": item["text"],
+                    "search_text": item["fts_text"],
                 },
             )
         )
@@ -264,6 +362,9 @@ def create_schema() -> zvec.CollectionSchema:
             zvec.FieldSchema("heading", zvec.DataType.STRING),
             zvec.FieldSchema("title", zvec.DataType.STRING),
             zvec.FieldSchema("type", zvec.DataType.STRING),
+            zvec.FieldSchema("tags", zvec.DataType.ARRAY_STRING),
+            zvec.FieldSchema("project", zvec.DataType.STRING),
+            zvec.FieldSchema("timestamp", zvec.DataType.STRING),
             zvec.FieldSchema(
                 "search_text",
                 zvec.DataType.STRING,
@@ -339,41 +440,107 @@ def normalize_fts_text(text: str) -> str:
     return " ".join(token_lemma(token) for token in TOKEN_RE.findall(text.casefold()))
 
 
-def lexical_bonus(query: str, fields: dict[str, Any]) -> float:
-    normalized_query = query.casefold().strip()
-    haystack = "\n".join(
-        str(fields.get(name, "")) for name in ("title", "heading", "type", "path", "text")
-    ).casefold()
-    if not normalized_query or not haystack:
-        return 0.0
+def result_matches_filters(fields: dict[str, Any], options: SearchOptions) -> bool:
+    if options.doc_type and str(fields.get("type", "")).casefold() != options.doc_type.casefold():
+        return False
+    if options.project and str(fields.get("project", "")).casefold() != options.project.casefold():
+        return False
+    if options.path_pattern and not fnmatch.fnmatch(
+        str(fields.get("path", "")).casefold(),
+        options.path_pattern.casefold(),
+    ):
+        return False
 
-    bonus = 0.0
-    if normalized_query in haystack:
-        bonus += 0.25
+    field_tags = {str(tag).casefold() for tag in (fields.get("tags") or [])}
+    if options.tags and not all(tag.casefold() in field_tags for tag in options.tags):
+        return False
 
-    query_tokens = lexical_tokens(normalized_query)
-    haystack_tokens = lexical_tokens(haystack)
-    if query_tokens:
-        exact_matches = len(query_tokens & haystack_tokens)
-        bonus += min(0.24, 0.06 * exact_matches)
-
-        unmatched_query = query_tokens - haystack_tokens
-        if unmatched_query:
-            query_lemmas = {token_lemma(token) for token in unmatched_query}
-            haystack_lemmas = {token_lemma(token) for token in haystack_tokens}
-            lemma_matches = len(query_lemmas & haystack_lemmas)
-            bonus += min(0.12, 0.03 * lemma_matches)
-    return bonus
+    timestamp = str(fields.get("timestamp", ""))
+    timestamp_from = timestamp[:10] if len(options.date_from) == 10 else timestamp
+    timestamp_to = timestamp[:10] if len(options.date_to) == 10 else timestamp
+    if options.date_from and (not timestamp or timestamp_from < options.date_from):
+        return False
+    if options.date_to and (not timestamp or timestamp_to > options.date_to):
+        return False
+    return True
 
 
-def rerank_results(results: list[Any], query: str, topk: int) -> list[tuple[float, Any]]:
-    scored = []
-    for result in results:
-        fields = doc_fields(result)
-        adjusted_score = doc_score(result) - lexical_bonus(query, fields)
-        scored.append((adjusted_score, result))
-    scored.sort(key=lambda item: item[0])
-    return scored[:topk]
+def semantic_relevance(score: float) -> float:
+    return max(0.0, min(1.0, 1.0 - score))
+
+
+def fts_relevance(score: float) -> float:
+    positive = max(0.0, score)
+    return positive / (1.0 + positive)
+
+
+def matching_terms(query: str, fields: dict[str, Any]) -> list[str]:
+    query_lemmas = {token_lemma(token) for token in lexical_tokens(query)}
+    if not query_lemmas:
+        return []
+    text = "\n".join(
+        str(fields.get(name, "")) for name in ("title", "heading", "path", "text")
+    )
+    matched: dict[str, str] = {}
+    for token in TOKEN_RE.findall(text):
+        normalized = token.casefold()
+        if token_lemma(normalized) in query_lemmas:
+            matched.setdefault(normalized, token)
+    return sorted(matched.values(), key=str.casefold)
+
+
+def weighted_rrf(
+    semantic_results: list[Any],
+    fts_results: list[Any],
+    options: SearchOptions,
+) -> list[dict[str, Any]]:
+    fused: dict[str, dict[str, Any]] = {}
+    branches = (
+        ("semantic", semantic_results, options.semantic_weight),
+        ("fts", fts_results, options.fts_weight),
+    )
+    for signal, results, weight in branches:
+        if weight <= 0:
+            continue
+        for rank, result in enumerate(results, start=1):
+            identifier = doc_id(result)
+            item = fused.setdefault(
+                identifier,
+                {
+                    "result": result,
+                    "rrf_score": 0.0,
+                    "semantic_score": None,
+                    "fts_score": None,
+                    "signals": [],
+                },
+            )
+            item["rrf_score"] += weight / (RRF_RANK_CONSTANT + rank)
+            item[f"{signal}_score"] = doc_score(result)
+            item["signals"].append(signal)
+    return sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)
+
+
+def hybrid_relevance(item: dict[str, Any], options: SearchOptions) -> float:
+    semantic = (
+        semantic_relevance(item["semantic_score"])
+        if item["semantic_score"] is not None
+        else 0.0
+    )
+    fts = fts_relevance(item["fts_score"]) if item["fts_score"] is not None else 0.0
+    total_weight = options.semantic_weight + options.fts_weight
+    return (
+        options.semantic_weight * semantic + options.fts_weight * fts
+    ) / total_weight
+
+
+def result_reason(signals: list[str], terms: list[str]) -> str:
+    if signals == ["semantic"]:
+        return "Семантическая близость запроса и фрагмента."
+    if signals == ["fts"]:
+        return f"Совпали термины: {', '.join(terms)}." if terms else "Полнотекстовое совпадение."
+    if terms:
+        return f"Семантическая близость и термины: {', '.join(terms)}."
+    return "Результат объединённого семантического и полнотекстового поиска."
 
 
 def search_collection(
@@ -383,57 +550,113 @@ def search_collection(
     rerank_pool: int,
     model_key: str = DEFAULT_MODEL,
     search_mode: str = DEFAULT_SEARCH_MODE,
+    options: SearchOptions | None = None,
 ) -> list[dict[str, Any]]:
     if not query:
         raise ValueError("для поиска нужен непустой запрос")
 
     model_key = normalize_model_key(model_key)
     search_mode = normalize_search_mode(search_mode)
-    cache_key = (model_key, search_mode, query.casefold().strip(), topk)
+    options = options or SearchOptions()
+    options.validate()
+    cache_key = (
+        model_key,
+        search_mode,
+        query.casefold().strip(),
+        topk,
+        rerank_pool,
+        options,
+    )
     cached = _QUERY_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
+    pool_size = max(topk, rerank_pool)
+    semantic_results: list[Any] = []
+    fts_results: list[Any] = []
     with _SEARCH_LOCK:
-        if search_mode == "semantic":
+        if search_mode in ("semantic", "hybrid") and options.semantic_weight > 0:
             vector_query = zvec.Query("embedding", vector=embed(query, model_key, kind="query"))
-            results = collection.query(vector_query, topk=topk)
-        elif search_mode == "fts":
+            semantic_results = collection.query(vector_query, topk=pool_size)
+        if search_mode in ("fts", "hybrid") and options.fts_weight > 0:
             fts_query = zvec.Query(
                 "search_text",
                 fts=zvec.Fts(match_string=normalize_fts_text(query)),
             )
-            results = collection.query(fts_query, topk=topk)
-        else:
-            from zvec.extension.multi_vector_reranker import RrfReRanker
+            fts_results = collection.query(fts_query, topk=pool_size)
 
-            vector_query = zvec.Query("embedding", vector=embed(query, model_key, kind="query"))
-            fts_query = zvec.Query(
-                "search_text",
-                fts=zvec.Fts(match_string=normalize_fts_text(query)),
-            )
-            results = collection.query(
-                [vector_query, fts_query],
-                topk=topk,
-                reranker=RrfReRanker(rank_constant=60),
-            )
+    semantic_results = [
+        result for result in semantic_results if result_matches_filters(doc_fields(result), options)
+    ]
+    fts_results = [
+        result for result in fts_results if result_matches_filters(doc_fields(result), options)
+    ]
+
+    ranked: list[dict[str, Any]]
+    if search_mode == "semantic":
+        ranked = [
+            {
+                "result": result,
+                "score": doc_score(result),
+                "relevance": semantic_relevance(doc_score(result)),
+                "semantic_score": doc_score(result),
+                "fts_score": None,
+                "signals": ["semantic"],
+            }
+            for result in semantic_results
+        ]
+    elif search_mode == "fts":
+        ranked = [
+            {
+                "result": result,
+                "score": doc_score(result),
+                "relevance": fts_relevance(doc_score(result)),
+                "semantic_score": None,
+                "fts_score": doc_score(result),
+                "signals": ["fts"],
+            }
+            for result in fts_results
+        ]
+    else:
+        ranked = weighted_rrf(semantic_results, fts_results, options)
+        for item in ranked:
+            item["score"] = item["rrf_score"]
+            item["relevance"] = hybrid_relevance(item, options)
 
     output: list[dict[str, Any]] = []
-    for rank, result in enumerate(results, start=1):
+    for item in ranked:
+        if item["relevance"] < options.min_relevance:
+            continue
+        result = item["result"]
         fields = doc_fields(result)
+        terms = matching_terms(query, fields)
+        signals = item["signals"]
         output.append(
             {
-                "rank": rank,
-                "score": doc_score(result),
+                "rank": len(output) + 1,
+                "score": item["score"],
+                "relevance": item["relevance"],
+                "signals": signals,
+                "reason": result_reason(signals, terms),
+                "match_terms": terms,
+                "raw_scores": {
+                    "semantic": item["semantic_score"],
+                    "fts": item["fts_score"],
+                },
                 "id": doc_id(result),
                 "title": fields.get("title", ""),
                 "path": fields.get("path", ""),
                 "chunk": fields.get("chunk", ""),
                 "heading": fields.get("heading", ""),
                 "type": fields.get("type", ""),
+                "tags": fields.get("tags", []),
+                "project": fields.get("project", ""),
+                "timestamp": fields.get("timestamp", ""),
                 "text": fields.get("text", ""),
             }
         )
+        if len(output) >= topk:
+            break
     if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
         _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)))
     _QUERY_CACHE[cache_key] = output
@@ -445,11 +668,15 @@ def format_search_results(results: list[dict[str, Any]], snippet: int) -> str:
     for item in results:
         text = str(item.get("text", "")).replace("\n", " ")
         text_snippet = text[:snippet].strip()
-        lines.append(f"{item['rank']}. score={item['score']:.4f} id={item['id']}")
+        lines.append(
+            f"{item['rank']}. relevance={item['relevance']:.4f} "
+            f"score={item['score']:.4f} id={item['id']}"
+        )
         lines.append(f"   title: {item.get('title', '')}")
         lines.append(f"   path:  {item.get('path', '')}")
         if item.get("heading"):
             lines.append(f"   heading: {item.get('heading', '')}")
+        lines.append(f"   reason: {item.get('reason', '')}")
         if text_snippet:
             lines.append(f"   text:  {text_snippet}")
     return "\n".join(lines)
@@ -498,11 +725,19 @@ def build_index(okf_dir: Path, db_dir: Path, model_key: str = DEFAULT_MODEL) -> 
 
 
 def read_active_db_root(default_db_root: Path) -> Path:
-    try:
-        value = _ACTIVE_DB_FILE.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return default_db_root
-    return Path(value).resolve() if value else default_db_root
+    candidates = (
+        _ACTIVE_DB_FILE,
+        default_db_root.parent / "active-db-root",
+        default_db_root.parent / ".active-db-root",
+    )
+    for active_file in candidates:
+        try:
+            value = active_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            continue
+        if value:
+            return Path(value).resolve()
+    return default_db_root
 
 
 def write_active_db_root(db_root: Path) -> None:
@@ -666,7 +901,8 @@ def command_index(args: argparse.Namespace) -> None:
 
 def command_search(args: argparse.Namespace) -> None:
     model_key = normalize_model_key(args.model)
-    db_dir = model_db_dir(Path(args.db).resolve(), model_key)
+    db_root = Path(args.db).resolve()
+    db_dir = model_db_dir(read_active_db_root(db_root), model_key)
     collection = zvec.open(str(db_dir))
     query = args.query
     if args.query_b64:
@@ -674,8 +910,135 @@ def command_search(args: argparse.Namespace) -> None:
     if not query:
         raise SystemExit("укажите поисковый запрос или --query-b64")
 
-    results = search_collection(collection, query, args.topk, args.rerank_pool, model_key, args.mode)
+    options = make_search_options(
+        semantic_weight=args.semantic_weight,
+        fts_weight=args.fts_weight,
+        min_relevance=args.min_relevance,
+        doc_type=args.type,
+        tags=args.tags,
+        path_pattern=args.path,
+        project=args.project,
+        date_from=args.date_from,
+        date_to=args.date_to,
+    )
+    results = search_collection(
+        collection,
+        query,
+        args.topk,
+        args.rerank_pool,
+        model_key,
+        args.mode,
+        options,
+    )
     print(format_search_results(results, args.snippet))
+
+
+def benchmark_rank(results: list[dict[str, Any]], expected: str) -> int:
+    needle = expected.casefold()
+    for item in results:
+        haystack = "\n".join(
+            str(item.get(name, "")) for name in ("title", "heading", "path", "text")
+        ).casefold()
+        if needle in haystack:
+            return int(item["rank"])
+    return 0
+
+
+def benchmark_http_search(
+    service_url: str,
+    query: str,
+    topk: int,
+    rerank_pool: int,
+    model_key: str,
+    mode: str,
+    options: SearchOptions,
+) -> list[dict[str, Any]]:
+    params = urlencode({
+        "q": query,
+        "topk": topk,
+        "rerank_pool": rerank_pool,
+        "model": model_key,
+        "mode": mode,
+        "semantic_weight": options.semantic_weight,
+        "fts_weight": options.fts_weight,
+        "min_relevance": options.min_relevance,
+    })
+    with urlopen(f"{service_url.rstrip('/')}/search?{params}", timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload["results"]
+
+
+def command_benchmark(args: argparse.Namespace) -> None:
+    benchmark_path = Path(args.file).resolve()
+    tests = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    if not isinstance(tests, list) or not tests:
+        raise SystemExit("benchmark-файл должен содержать непустой JSON-массив")
+
+    model_key = normalize_model_key(args.model)
+    collection = None
+    if not args.service_url:
+        db_root = Path(args.db).resolve()
+        db_dir = model_db_dir(read_active_db_root(db_root), model_key)
+        collection = zvec.open(str(db_dir))
+    modes = [normalize_search_mode(mode) for mode in args.modes.split(",") if mode.strip()]
+    options = make_search_options(
+        semantic_weight=args.semantic_weight,
+        fts_weight=args.fts_weight,
+        min_relevance=args.min_relevance,
+    )
+    report: dict[str, Any] = {
+        "model": model_key,
+        "queries": len(tests),
+        "topk": args.topk,
+        "modes": {},
+    }
+
+    for mode in modes:
+        rows: list[dict[str, Any]] = []
+        for test in tests:
+            query = str(test["query"])
+            expected = str(test["expected_contains"])
+            _QUERY_CACHE.clear()
+            started = time.perf_counter()
+            if args.service_url:
+                results = benchmark_http_search(
+                    args.service_url,
+                    query,
+                    args.topk,
+                    args.rerank_pool,
+                    model_key,
+                    mode,
+                    options,
+                )
+            else:
+                results = search_collection(
+                    collection,
+                    query,
+                    args.topk,
+                    args.rerank_pool,
+                    model_key,
+                    mode,
+                    options,
+                )
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            rank = benchmark_rank(results, expected)
+            rows.append({
+                "query": query,
+                "expected_contains": expected,
+                "rank": rank,
+                "elapsed_ms": round(elapsed_ms, 2),
+            })
+
+        reciprocal_ranks = [1 / row["rank"] if row["rank"] else 0 for row in rows]
+        report["modes"][mode] = {
+            "top1": sum(row["rank"] == 1 for row in rows) / len(rows),
+            "top3": sum(0 < row["rank"] <= 3 for row in rows) / len(rows),
+            "mrr": sum(reciprocal_ranks) / len(rows),
+            "no_result": sum(row["rank"] == 0 for row in rows),
+            "average_ms": sum(row["elapsed_ms"] for row in rows) / len(rows),
+            "results": rows,
+        }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 class SearchHandler(BaseHTTPRequestHandler):
@@ -704,7 +1067,7 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def render_home(self) -> str:
-        return """<!doctype html>
+        return r"""<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
@@ -713,14 +1076,21 @@ class SearchHandler(BaseHTTPRequestHandler):
   <style>
     body { font-family: system-ui, Segoe UI, Arial, sans-serif; margin: 32px; color: #1f2937; background: #f8fafc; }
     main { max-width: 980px; margin: 0 auto; }
-    form { display: flex; gap: 8px; margin: 20px 0; }
+    form { margin: 20px 0; }
+    .search-row, .filters { display: flex; gap: 8px; flex-wrap: wrap; }
+    .filters { margin-top: 10px; }
     input, select, button { font: inherit; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 6px; }
-    input[type=text] { flex: 1; }
+    #query { flex: 1; min-width: 260px; }
+    .filters input { flex: 1; min-width: 140px; }
     input[type=number] { width: 76px; }
     button { background: #0f766e; color: white; border-color: #0f766e; cursor: pointer; }
+    details { margin-top: 10px; color: #475569; }
+    summary { cursor: pointer; }
     article { background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 16px; margin: 10px 0; }
     .meta { color: #64748b; font-size: 13px; margin-bottom: 6px; }
     .score { font-variant-numeric: tabular-nums; }
+    .reason { color: #475569; font-size: 14px; margin-top: 6px; }
+    mark { background: #fde68a; color: inherit; padding: 0 1px; }
     pre { white-space: pre-wrap; margin: 8px 0 0; font: inherit; }
   </style>
 </head>
@@ -728,18 +1098,34 @@ class SearchHandler(BaseHTTPRequestHandler):
 <main>
   <h1>Поиск по базе OKF</h1>
   <form id="searchForm">
-    <input id="query" type="text" placeholder="миграция, портал поставщиков, прошивка кассы" autofocus>
-    <select id="model">
-      <option value="e5">многоязычная E5 small</option>
-      <option value="paraphrase">многоязычная paraphrase MiniLM</option>
-    </select>
-    <select id="mode">
-      <option value="hybrid">Семантика + FTS</option>
-      <option value="semantic">Только семантика</option>
-      <option value="fts">Только FTS</option>
-    </select>
-    <input id="topk" type="number" min="1" max="20" value="5">
-    <button type="submit">Найти</button>
+    <div class="search-row">
+      <input id="query" type="text" placeholder="миграция, портал поставщиков, прошивка кассы" autofocus>
+      <select id="model">
+        <option value="e5">многоязычная E5 small</option>
+        <option value="paraphrase">многоязычная paraphrase MiniLM</option>
+      </select>
+      <select id="mode">
+        <option value="hybrid">Семантика + FTS</option>
+        <option value="semantic">Только семантика</option>
+        <option value="fts">Только FTS</option>
+      </select>
+      <input id="topk" type="number" min="1" max="20" value="5" title="Количество результатов">
+      <button type="submit">Найти</button>
+    </div>
+    <details>
+      <summary>Фильтры и ранжирование</summary>
+      <div class="filters">
+        <input id="filterType" type="text" placeholder="Тип">
+        <input id="filterTags" type="text" placeholder="Теги через запятую">
+        <input id="filterPath" type="text" placeholder="Путь: topics/*">
+        <input id="filterProject" type="text" placeholder="Проект">
+        <input id="dateFrom" type="text" placeholder="Дата от">
+        <input id="dateTo" type="text" placeholder="Дата до">
+        <input id="minRelevance" type="number" min="0" max="1" step="0.05" value="0.25" title="Минимальная релевантность">
+        <input id="semanticWeight" type="number" min="0" step="0.1" value="1" title="Вес семантики">
+        <input id="ftsWeight" type="number" min="0" step="0.1" value="1" title="Вес FTS">
+      </div>
+    </details>
   </form>
   <div id="status"></div>
   <section id="results"></section>
@@ -750,6 +1136,15 @@ const query = document.getElementById('query');
 const topk = document.getElementById('topk');
 const model = document.getElementById('model');
 const mode = document.getElementById('mode');
+const filterType = document.getElementById('filterType');
+const filterTags = document.getElementById('filterTags');
+const filterPath = document.getElementById('filterPath');
+const filterProject = document.getElementById('filterProject');
+const dateFrom = document.getElementById('dateFrom');
+const dateTo = document.getElementById('dateTo');
+const minRelevance = document.getElementById('minRelevance');
+const semanticWeight = document.getElementById('semanticWeight');
+const ftsWeight = document.getElementById('ftsWeight');
 const statusEl = document.getElementById('status');
 const resultsEl = document.getElementById('results');
 form.addEventListener('submit', async (event) => {
@@ -759,18 +1154,50 @@ form.addEventListener('submit', async (event) => {
   statusEl.textContent = 'Поиск...';
   resultsEl.innerHTML = '';
   const started = performance.now();
-  const response = await fetch(`/search?q=${encodeURIComponent(q)}&topk=${encodeURIComponent(topk.value)}&model=${encodeURIComponent(model.value)}&mode=${encodeURIComponent(mode.value)}`);
+  const params = new URLSearchParams({
+    q,
+    topk: topk.value,
+    model: model.value,
+    mode: mode.value,
+    type: filterType.value,
+    tags: filterTags.value,
+    path: filterPath.value,
+    project: filterProject.value,
+    date_from: dateFrom.value,
+    date_to: dateTo.value,
+    min_relevance: minRelevance.value,
+    semantic_weight: semanticWeight.value,
+    fts_weight: ftsWeight.value,
+  });
+  const response = await fetch(`/search?${params}`);
   const data = await response.json();
+  if (!response.ok) {
+    statusEl.textContent = data.error || 'Ошибка поиска';
+    return;
+  }
   const elapsed = Math.round(performance.now() - started);
   statusEl.textContent = `${data.model} / ${data.mode}: результатов ${data.results.length}, ${elapsed} мс`;
   resultsEl.innerHTML = data.results.map((item) => `
     <article>
-      <div class="meta"><span class="score">${Number(item.score).toFixed(4)}</span> | ${escapeHtml(item.path)}${item.heading ? ' | ' + escapeHtml(item.heading) : ''}</div>
+      <div class="meta"><span class="score">${Math.round(Number(item.relevance) * 100)}%</span> | ${escapeHtml(item.path)}${item.heading ? ' | ' + escapeHtml(item.heading) : ''}</div>
       <strong>${escapeHtml(item.title || '')}</strong>
-      <pre>${escapeHtml(item.text || '')}</pre>
+      <pre>${highlightText(item.text || '', item.match_terms || [])}</pre>
+      <div class="reason">${escapeHtml(item.reason || '')}</div>
     </article>
   `).join('');
 });
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+function highlightText(value, terms) {
+  let escaped = escapeHtml(value);
+  const ordered = [...terms].sort((a, b) => b.length - a.length);
+  for (const term of ordered) {
+    const safeTerm = escapeHtml(term);
+    escaped = escaped.replace(new RegExp(escapeRegExp(safeTerm), 'giu'), '<mark>$&</mark>');
+  }
+  return escaped;
+}
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
@@ -819,10 +1246,33 @@ function escapeHtml(value) {
         snippet = int((params.get("snippet") or ["220"])[0])
 
         try:
+            options = make_search_options(
+                semantic_weight=(
+                    float(params["semantic_weight"][0]) if params.get("semantic_weight") else None
+                ),
+                fts_weight=float(params["fts_weight"][0]) if params.get("fts_weight") else None,
+                min_relevance=(
+                    float(params["min_relevance"][0]) if params.get("min_relevance") else None
+                ),
+                doc_type=(params.get("type") or [""])[0],
+                tags=(params.get("tags") or [""])[0],
+                path_pattern=(params.get("path") or [""])[0],
+                project=(params.get("project") or [""])[0],
+                date_from=(params.get("date_from") or [""])[0],
+                date_to=(params.get("date_to") or [""])[0],
+            )
             collection = _SEARCH_COLLECTIONS.get(model_key)
             if collection is None:
                 raise RuntimeError(f"коллекция поиска не открыта для модели {model_key}")
-            results = search_collection(collection, query, topk, rerank_pool, model_key, search_mode)
+            results = search_collection(
+                collection,
+                query,
+                topk,
+                rerank_pool,
+                model_key,
+                search_mode,
+                options,
+            )
             self.send_json(
                 200,
                 {
@@ -831,6 +1281,11 @@ function escapeHtml(value) {
                     "mode": search_mode,
                     "model_name": MODEL_CONFIGS[model_key]["name"],
                     "topk": topk,
+                    "min_relevance": options.min_relevance,
+                    "weights": {
+                        "semantic": options.semantic_weight,
+                        "fts": options.fts_weight,
+                    },
                     "results": [
                         {**item, "text": str(item.get("text", ""))[:snippet]} for item in results
                     ],
@@ -900,6 +1355,19 @@ def command_serve(args: argparse.Namespace) -> None:
     server.serve_forever()
 
 
+def add_quality_arguments(parser: argparse.ArgumentParser, include_filters: bool = True) -> None:
+    parser.add_argument("--semantic-weight", type=float, help="вес семантической ветки")
+    parser.add_argument("--fts-weight", type=float, help="вес полнотекстовой ветки")
+    parser.add_argument("--min-relevance", type=float, help="минимальная релевантность от 0 до 1")
+    if include_filters:
+        parser.add_argument("--type", default="", help="фильтр по полю type")
+        parser.add_argument("--tags", default="", help="обязательные теги через запятую")
+        parser.add_argument("--path", default="", help="маска пути, например topics/*")
+        parser.add_argument("--project", default="", help="фильтр по полю project")
+        parser.add_argument("--date-from", default="", help="минимальная дата или timestamp")
+        parser.add_argument("--date-to", default="", help="максимальная дата или timestamp")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Индексирование и поиск по OKF Markdown с помощью zvec.")
     parser.add_argument("--db", default=str(DEFAULT_DB_ROOT), help="корневой каталог коллекций zvec")
@@ -918,7 +1386,18 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--topk", type=int, default=5)
     search_parser.add_argument("--rerank-pool", type=int, default=50)
     search_parser.add_argument("--snippet", type=int, default=220)
+    add_quality_arguments(search_parser)
     search_parser.set_defaults(func=command_search)
+
+    benchmark_parser = subparsers.add_parser("benchmark", help="сравнить качество режимов поиска")
+    benchmark_parser.add_argument("--file", default="benchmarks/queries.json")
+    benchmark_parser.add_argument("--service-url", help="HTTP-адрес запущенного сервиса")
+    benchmark_parser.add_argument("--model", default=DEFAULT_MODEL, choices=list(MODEL_CONFIGS.keys()))
+    benchmark_parser.add_argument("--modes", default="semantic,fts,hybrid")
+    benchmark_parser.add_argument("--topk", type=int, default=5)
+    benchmark_parser.add_argument("--rerank-pool", type=int, default=50)
+    add_quality_arguments(benchmark_parser, include_filters=False)
+    benchmark_parser.set_defaults(func=command_benchmark)
 
     serve_parser = subparsers.add_parser("serve", help="запустить HTTP-сервис поиска")
     serve_parser.add_argument("--okf", default=str(DEFAULT_OKF_DIR), help="каталог OKF Markdown")

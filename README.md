@@ -97,6 +97,42 @@ HF_TOKEN
 равно `3`. Новая версия становится активной только после успешной сборки всех
 моделей. При ошибке сервис продолжает использовать прежние OKF и индекс.
 
+Веса гибридного поиска и порог выдачи задаются через
+`OKF_ZVEC_SEMANTIC_WEIGHT`, `OKF_ZVEC_FTS_WEIGHT` и
+`OKF_ZVEC_MIN_RELEVANCE`. Порог находится в диапазоне от `0` до `1`.
+
+Фильтры доступны в HTTP API, CLI и веб-интерфейсе:
+
+```bash
+okf-zvec search "миграция" \
+  --mode hybrid \
+  --type software-project \
+  --tags zvec,okf \
+  --path "topics/*" \
+  --project search \
+  --date-from 2026-07-01 \
+  --min-relevance 0.35 \
+  --semantic-weight 1.5 \
+  --fts-weight 1
+```
+
+Каждый результат содержит нормализованную `relevance`, использованные сигналы,
+причину попадания в выдачу и словоформы для подсветки.
+
+## Проверка качества
+
+Контрольный набор находится в `benchmarks/queries.json`. Команда сравнивает
+`semantic`, `fts` и `hybrid`, рассчитывая Top-1, Top-3, MRR, среднюю задержку и
+число пропусков:
+
+```bash
+okf-zvec benchmark \
+  --file benchmarks/queries.json \
+  --service-url http://127.0.0.1:8765 \
+  --model e5 \
+  --modes semantic,fts,hybrid
+```
+
 ## Безопасность
 
 - Не добавляйте в Git токены сервиса и Hugging Face, закрытые базы OKF и

@@ -1,0 +1,42 @@
+[
+  {
+    "query": "миграция",
+    "expected_contains": "3CX Migration"
+  },
+  {
+    "query": "переезд телефонии",
+    "expected_contains": "3CX Migration"
+  },
+  {
+    "query": "переносом телефонии",
+    "expected_contains": "3CX Migration"
+  },
+  {
+    "query": "портал поставщиков",
+    "expected_contains": "Supplier Portal"
+  },
+  {
+    "query": "поставщиками",
+    "expected_contains": "Supplier Portal"
+  },
+  {
+    "query": "каталог товаров контрагента",
+    "expected_contains": "Supplier Portal"
+  },
+  {
+    "query": "кассы",
+    "expected_contains": "POS Center"
+  },
+  {
+    "query": "кассами",
+    "expected_contains": "POS Center"
+  },
+  {
+    "query": "фискальный регистратор",
+    "expected_contains": "POS Center"
+  },
+  {
+    "query": "обновление прошивки ККТ",
+    "expected_contains": "POS Center"
+  }
+]
