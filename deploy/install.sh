@@ -13,18 +13,20 @@ apt-get update
 apt-get install -y python3 python3-venv ca-certificates openssl
 
 install -d -m 0755 \
-  "${APP_HOME}/app" \
   "${APP_HOME}/config" \
   "${APP_HOME}/data/okf" \
   "${APP_HOME}/data/db"
-install -m 0644 "${PROJECT_DIR}/src/okf_zvec.py" "${APP_HOME}/app/okf_zvec.py"
 
 python3 -m venv "${APP_HOME}/.venv"
 "${APP_HOME}/.venv/bin/pip" install --upgrade pip
 "${APP_HOME}/.venv/bin/pip" install \
   --index-url https://download.pytorch.org/whl/cpu \
   torch
-"${APP_HOME}/.venv/bin/pip" install -r "${PROJECT_DIR}/requirements.txt"
+"${APP_HOME}/.venv/bin/pip" install "${PROJECT_DIR}"
+
+if [[ ! -e /etc/okf-zvec-search.env ]]; then
+  install -m 0640 "${PROJECT_DIR}/.env.example" /etc/okf-zvec-search.env
+fi
 
 if [[ ! -s "${APP_HOME}/config/service-token" ]]; then
   openssl rand -hex 32 > "${APP_HOME}/config/service-token"

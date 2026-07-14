@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import OrderedDict
 import contextlib
 import fnmatch
 import hashlib
@@ -24,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -62,7 +63,13 @@ TOKEN_RE = re.compile(r"[\wА-Яа-яЁё-]+", re.UNICODE)
 _MODELS: dict[str, Any] = {}
 _SEARCH_COLLECTIONS: dict[str, Any] = {}
 _SEARCH_LOCK = threading.Lock()
-_QUERY_CACHE: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+_MODEL_LOCK = threading.RLock()
+_MODEL_INFERENCE_LOCKS = {model_key: threading.Lock() for model_key in MODEL_CONFIGS}
+_SYNC_LOCK = threading.Lock()
+_SYNC_IN_PROGRESS = threading.Event()
+_RESTART_REQUESTED = threading.Event()
+_QUERY_CACHE_LOCK = threading.Lock()
+_QUERY_CACHE: OrderedDict[tuple[Any, ...], list[dict[str, Any]]] = OrderedDict()
 _QUERY_CACHE_MAX = 256
 _SERVICE_TOKEN_FILE = Path(
     os.environ.get("OKF_ZVEC_TOKEN_FILE", str(APP_HOME / "config" / "service-token"))
@@ -87,6 +94,24 @@ DEFAULT_FTS_WEIGHT = 1.0
 DEFAULT_MIN_RELEVANCE = 0.25
 RRF_RANK_CONSTANT = 60
 SERVICE_STARTED_AT = time.time()
+DEFAULT_MAX_SYNC_BYTES = 100 * 1024 * 1024
+DEFAULT_MAX_EXTRACTED_BYTES = 500 * 1024 * 1024
+DEFAULT_MAX_ARCHIVE_MEMBERS = 10_000
+DEFAULT_INDEX_BATCH_SIZE = 256
+MAX_TOPK = 100
+MAX_RERANK_POOL = 1_000
+MAX_SNIPPET = 10_000
+
+
+class RequestError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class ModelLoadError(RuntimeError):
+    pass
 
 
 def log_event(event: str, level: str = "info", **fields: Any) -> None:
@@ -190,34 +215,39 @@ def save_preload_setting(value: str) -> tuple[str, list[str]]:
 
 def apply_preload_setting(value: str, unload_others: bool = True) -> tuple[str, list[str]]:
     canonical, models = normalize_preload_setting(value)
+    for model_key in models:
+        get_model(model_key)
     with _SEARCH_LOCK:
-        for model_key in models:
-            get_model(model_key)
-        if unload_others:
-            for model_key in list(_MODELS):
-                if model_key not in models:
-                    _MODELS.pop(model_key, None)
-            gc.collect()
+        with _MODEL_LOCK:
+            if unload_others:
+                for model_key in list(_MODELS):
+                    if model_key not in models:
+                        _MODELS.pop(model_key, None)
+                gc.collect()
+            loaded_models = sorted(_MODELS)
         with _STATE_LOCK:
             for model_key in MODEL_CONFIGS:
                 state = _SERVICE_STATE["models"].setdefault(
                     model_key,
                     {"name": MODEL_CONFIGS[model_key]["name"]},
                 )
-                state["loaded"] = model_key in _MODELS
-    log_event("preload_setting_applied", value=canonical, loaded_models=sorted(_MODELS))
+                state["loaded"] = model_key in loaded_models
+    log_event("preload_setting_applied", value=canonical, loaded_models=loaded_models)
     return canonical, models
 
 
 def reload_preloaded_models() -> tuple[str, list[str]]:
     canonical, models = configured_preload_setting()
     with _SEARCH_LOCK:
-        for model_key in models:
-            _MODELS.pop(model_key, None)
+        with _MODEL_LOCK:
+            for model_key in models:
+                _MODELS.pop(model_key, None)
         gc.collect()
-        for model_key in models:
-            get_model(model_key)
-    log_event("preloaded_models_reloaded", value=canonical, loaded_models=sorted(_MODELS))
+    for model_key in models:
+        get_model(model_key)
+    with _MODEL_LOCK:
+        loaded_models = sorted(_MODELS)
+    log_event("preloaded_models_reloaded", value=canonical, loaded_models=loaded_models)
     return canonical, models
 
 
@@ -250,6 +280,37 @@ def env_float(name: str, default: float) -> float:
         return float(raw_value)
     except ValueError as exc:
         raise ValueError(f"{name} должно быть числом") from exc
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} должно быть целым числом") from exc
+    if value < minimum:
+        raise ValueError(f"{name} должно быть не меньше {minimum}")
+    return value
+
+
+def bounded_int(
+    value: str,
+    name: str,
+    minimum: int,
+    maximum: int,
+    overflow_status: int = 400,
+) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise RequestError(400, f"{name} должно быть целым числом") from exc
+    if parsed > maximum:
+        raise RequestError(overflow_status, f"{name} должно быть не больше {maximum}")
+    if parsed < minimum:
+        raise RequestError(400, f"{name} должно быть от {minimum} до {maximum}")
+    return parsed
 
 
 def split_filter_tags(value: str | None) -> tuple[str, ...]:
@@ -311,49 +372,56 @@ def normalize_search_mode(search_mode: str | None) -> str:
 
 def get_model(model_key: str = DEFAULT_MODEL) -> Any:
     model_key = normalize_model_key(model_key)
-    if model_key in _MODELS:
-        return _MODELS[model_key]
+    with _MODEL_LOCK:
+        if model_key in _MODELS:
+            return _MODELS[model_key]
 
-    started = time.perf_counter()
-    log_event("model_load_started", model=model_key, name=MODEL_CONFIGS[model_key]["name"])
-    try:
-        from sentence_transformers import SentenceTransformer
-    except ImportError as exc:
-        raise SystemExit(
-            "Для семантического поиска требуется sentence-transformers. "
-            "Установите зависимости проекта перед запуском сервиса."
-        ) from exc
+        started = time.perf_counter()
+        log_event("model_load_started", model=model_key, name=MODEL_CONFIGS[model_key]["name"])
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ModelLoadError(
+                "Для семантического поиска требуется sentence-transformers. "
+                "Установите зависимости проекта перед запуском сервиса."
+            ) from exc
 
-    try:
-        model = SentenceTransformer(MODEL_CONFIGS[model_key]["name"], local_files_only=True)
-    except Exception:
-        model = SentenceTransformer(MODEL_CONFIGS[model_key]["name"])
-    if hasattr(model, "get_embedding_dimension"):
-        actual_dimension = model.get_embedding_dimension()
-    else:
-        actual_dimension = model.get_sentence_embedding_dimension()
-    if actual_dimension != DIMENSION:
-        raise SystemExit(
-            f"Модель {MODEL_CONFIGS[model_key]['name']} возвращает {actual_dimension} измерений, "
-            f"а схема zvec ожидает {DIMENSION}."
+        try:
+            model = SentenceTransformer(
+                MODEL_CONFIGS[model_key]["name"],
+                device="cpu",
+                local_files_only=True,
+            )
+        except Exception:
+            try:
+                model = SentenceTransformer(MODEL_CONFIGS[model_key]["name"], device="cpu")
+            except Exception as exc:
+                raise ModelLoadError(f"не удалось загрузить модель {model_key}") from exc
+        if hasattr(model, "get_embedding_dimension"):
+            actual_dimension = model.get_embedding_dimension()
+        else:
+            actual_dimension = model.get_sentence_embedding_dimension()
+        if actual_dimension != DIMENSION:
+            raise ModelLoadError(
+                f"Модель {model_key} возвращает {actual_dimension} измерений вместо {DIMENSION}."
+            )
+        _MODELS[model_key] = model
+        duration = time.perf_counter() - started
+        _METRICS.record_model_load(model_key, duration)
+        with _STATE_LOCK:
+            model_state = _SERVICE_STATE["models"].setdefault(model_key, {})
+            model_state.update({
+                "name": MODEL_CONFIGS[model_key]["name"],
+                "loaded": True,
+                "load_seconds": round(duration, 3),
+            })
+        log_event(
+            "model_load_completed",
+            model=model_key,
+            name=MODEL_CONFIGS[model_key]["name"],
+            duration_seconds=round(duration, 3),
         )
-    _MODELS[model_key] = model
-    duration = time.perf_counter() - started
-    _METRICS.record_model_load(model_key, duration)
-    with _STATE_LOCK:
-        model_state = _SERVICE_STATE["models"].setdefault(model_key, {})
-        model_state.update({
-            "name": MODEL_CONFIGS[model_key]["name"],
-            "loaded": True,
-            "load_seconds": round(duration, 3),
-        })
-    log_event(
-        "model_load_completed",
-        model=model_key,
-        name=MODEL_CONFIGS[model_key]["name"],
-        duration_seconds=round(duration, 3),
-    )
-    return model
+        return model
 
 
 def prefixed_text(text: str, model_key: str, kind: str) -> str:
@@ -363,19 +431,29 @@ def prefixed_text(text: str, model_key: str, kind: str) -> str:
 
 
 def embed(text: str, model_key: str = DEFAULT_MODEL, kind: str = "query") -> list[float]:
-    vector = get_model(model_key).encode(prefixed_text(text, model_key, kind), normalize_embeddings=True)
+    model_key = normalize_model_key(model_key)
+    model = get_model(model_key)
+    with _MODEL_INFERENCE_LOCKS[model_key]:
+        vector = model.encode(
+            prefixed_text(text, model_key, kind),
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
     return vector.astype("float32").tolist()
 
 
 def embed_many(texts: list[str], model_key: str = DEFAULT_MODEL, kind: str = "passage") -> list[list[float]]:
     if not texts:
         return []
+    model_key = normalize_model_key(model_key)
     model = get_model(model_key)
-    vectors = model.encode(
-        [prefixed_text(text, model_key, kind) for text in texts],
-        normalize_embeddings=True,
-        batch_size=16,
-    )
+    with _MODEL_INFERENCE_LOCKS[model_key]:
+        vectors = model.encode(
+            [prefixed_text(text, model_key, kind) for text in texts],
+            normalize_embeddings=True,
+            batch_size=16,
+            show_progress_bar=False,
+        )
     return [vector.astype("float32").tolist() for vector in vectors]
 
 
@@ -460,11 +538,13 @@ def section_chunks(body: str) -> list[tuple[str, str]]:
     return chunks
 
 
-def iter_docs(okf_dir: Path, model_key: str = DEFAULT_MODEL) -> list[zvec.Doc]:
-    items: list[dict[str, Any]] = []
+def iter_doc_items(okf_dir: Path) -> Iterator[dict[str, Any]]:
     for path in sorted(okf_dir.rglob("*.md")):
         rel = path.relative_to(okf_dir).as_posix()
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"файл OKF должен быть в UTF-8: {rel}") from exc
         meta, body = split_frontmatter(text)
         title = metadata_text(meta.get("title")) or title_from_markdown(body, rel)
         doc_type = metadata_text(meta.get("type"))
@@ -474,7 +554,7 @@ def iter_docs(okf_dir: Path, model_key: str = DEFAULT_MODEL) -> list[zvec.Doc]:
         for chunk_index, (heading, chunk) in enumerate(section_chunks(body)):
             safe_id = "doc_" + hashlib.sha1(f"{rel}#{chunk_index}".encode("utf-8")).hexdigest()
             search_text = f"{title}\n{doc_type}\n{' '.join(tags)}\n{project}\n{heading}\n{chunk}"
-            items.append({
+            yield {
                 "id": safe_id,
                 "path": rel,
                 "chunk": str(chunk_index),
@@ -487,8 +567,10 @@ def iter_docs(okf_dir: Path, model_key: str = DEFAULT_MODEL) -> list[zvec.Doc]:
                 "text": chunk,
                 "search_text": search_text,
                 "fts_text": normalize_fts_text(search_text),
-            })
+            }
 
+
+def docs_from_items(items: list[dict[str, Any]], model_key: str) -> list[zvec.Doc]:
     docs: list[zvec.Doc] = []
     for item, vector in zip(
         items, embed_many([item["search_text"] for item in items], model_key, kind="passage"), strict=True
@@ -514,6 +596,10 @@ def iter_docs(okf_dir: Path, model_key: str = DEFAULT_MODEL) -> list[zvec.Doc]:
     return docs
 
 
+def iter_docs(okf_dir: Path, model_key: str = DEFAULT_MODEL) -> list[zvec.Doc]:
+    return docs_from_items(list(iter_doc_items(okf_dir)), model_key)
+
+
 def create_schema() -> zvec.CollectionSchema:
     return zvec.CollectionSchema(
         name="okf_memory",
@@ -536,7 +622,6 @@ def create_schema() -> zvec.CollectionSchema:
                 "text",
                 zvec.DataType.STRING,
                 nullable=False,
-                index_param=zvec.FtsIndexParam(tokenizer_name="standard"),
             ),
         ],
         vectors=zvec.VectorSchema(
@@ -704,6 +789,11 @@ def result_reason(signals: list[str], terms: list[str]) -> str:
     return "Результат объединённого семантического и полнотекстового поиска."
 
 
+def clear_query_cache() -> None:
+    with _QUERY_CACHE_LOCK:
+        _QUERY_CACHE.clear()
+
+
 def search_collection(
     collection: Any,
     query: str,
@@ -730,15 +820,19 @@ def search_collection(
         options,
     )
     if use_cache:
-        cached = _QUERY_CACHE.get(cache_key)
-        if cached is not None:
-            _METRICS.record_cache(True)
-            return cached
+        with _QUERY_CACHE_LOCK:
+            cached = _QUERY_CACHE.get(cache_key)
+            if cached is not None:
+                _QUERY_CACHE.move_to_end(cache_key)
+                _METRICS.record_cache(True)
+                return cached
         _METRICS.record_cache(False)
 
     pool_size = max(topk, rerank_pool)
     semantic_results: list[Any] = []
     fts_results: list[Any] = []
+    if search_mode in ("semantic", "hybrid") and options.semantic_weight > 0:
+        get_model(model_key)
     with _SEARCH_LOCK:
         if search_mode in ("semantic", "hybrid") and options.semantic_weight > 0:
             vector_query = zvec.Query("embedding", vector=embed(query, model_key, kind="query"))
@@ -823,9 +917,11 @@ def search_collection(
         if len(output) >= topk:
             break
     if use_cache:
-        if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
-            _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)))
-        _QUERY_CACHE[cache_key] = output
+        with _QUERY_CACHE_LOCK:
+            _QUERY_CACHE[cache_key] = output
+            _QUERY_CACHE.move_to_end(cache_key)
+            while len(_QUERY_CACHE) > _QUERY_CACHE_MAX:
+                _QUERY_CACHE.popitem(last=False)
     return output
 
 
@@ -904,12 +1000,16 @@ def collection_doc_count(collection: Any) -> int:
 def status_snapshot() -> dict[str, Any]:
     with _STATE_LOCK:
         state = json.loads(json.dumps(_SERVICE_STATE, default=str))
+    with _QUERY_CACHE_LOCK:
+        cache_entries = len(_QUERY_CACHE)
+    with _MODEL_LOCK:
+        loaded_models = sorted(_MODELS)
     preload_setting, _ = configured_preload_setting()
     state.update({
         "uptime_seconds": round(time.time() - SERVICE_STARTED_AT, 1),
-        "cache_entries": len(_QUERY_CACHE),
+        "cache_entries": cache_entries,
         "cache_limit": _QUERY_CACHE_MAX,
-        "loaded_models": sorted(_MODELS),
+        "loaded_models": loaded_models,
         "retained_versions": keep_versions(),
         "search_auth_enabled": bool(search_token()),
         "preload_models": preload_setting,
@@ -918,13 +1018,15 @@ def status_snapshot() -> dict[str, Any]:
 
 
 def prometheus_metrics() -> str:
+    with _QUERY_CACHE_LOCK:
+        cache_entries = len(_QUERY_CACHE)
     lines = [
         "# HELP okf_zvec_uptime_seconds Время работы сервиса.",
         "# TYPE okf_zvec_uptime_seconds gauge",
         f"okf_zvec_uptime_seconds {time.time() - SERVICE_STARTED_AT:.3f}",
         "# HELP okf_zvec_cache_entries Число ответов в кэше.",
         "# TYPE okf_zvec_cache_entries gauge",
-        f"okf_zvec_cache_entries {len(_QUERY_CACHE)}",
+        f"okf_zvec_cache_entries {cache_entries}",
     ]
     with _METRICS.lock:
         lines.extend([
@@ -965,8 +1067,10 @@ def prometheus_metrics() -> str:
             "# HELP okf_zvec_model_loaded Загружена ли модель в память.",
             "# TYPE okf_zvec_model_loaded gauge",
         ])
+        with _MODEL_LOCK:
+            loaded_models = set(_MODELS)
         for model_key in MODEL_CONFIGS:
-            loaded = 1 if model_key in _MODELS else 0
+            loaded = 1 if model_key in loaded_models else 0
             lines.append(f'okf_zvec_model_loaded{{model="{model_key}"}} {loaded}')
         lines.extend([
             "# HELP okf_zvec_model_load_seconds Время загрузки модели.",
@@ -989,12 +1093,26 @@ def prometheus_metrics() -> str:
 
 def safe_extract_tar(archive: Path, target: Path) -> None:
     target_root = target.resolve()
+    max_members = env_int("OKF_ZVEC_MAX_ARCHIVE_MEMBERS", DEFAULT_MAX_ARCHIVE_MEMBERS)
+    max_extracted = env_int("OKF_ZVEC_MAX_EXTRACTED_BYTES", DEFAULT_MAX_EXTRACTED_BYTES)
     with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
+        members = tar.getmembers()
+        if len(members) > max_members:
+            raise RequestError(413, f"в архиве больше {max_members} элементов")
+        total_size = 0
+        for member in members:
             member_target = (target_root / member.name).resolve()
             if not member_target.is_relative_to(target_root):
-                raise ValueError(f"небезопасный путь в tar-архиве: {member.name}")
-        tar.extractall(target_root, filter="data")
+                raise RequestError(400, "архив содержит небезопасный путь")
+            if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
+                raise RequestError(400, "архив содержит неподдерживаемый тип элемента")
+            if member.isfile():
+                total_size += member.size
+                if total_size > max_extracted:
+                    raise RequestError(413, "распакованный архив превышает допустимый размер")
+        if not hasattr(tarfile, "data_filter"):
+            raise RuntimeError("требуется Python с поддержкой безопасных фильтров tarfile")
+        tar.extractall(target_root, members=members, filter="data")
 
 
 def model_db_dir(db_root: Path, model_key: str) -> Path:
@@ -1003,16 +1121,28 @@ def model_db_dir(db_root: Path, model_key: str) -> Path:
 
 def build_index(okf_dir: Path, db_dir: Path, model_key: str = DEFAULT_MODEL) -> tuple[Any, int]:
     model_key = normalize_model_key(model_key)
-    docs = iter_docs(okf_dir, model_key)
     if db_dir.exists():
         shutil.rmtree(db_dir)
 
     collection = zvec.create_and_open(str(db_dir), create_schema())
-    if docs:
+    batch_size = env_int("OKF_ZVEC_INDEX_BATCH_SIZE", DEFAULT_INDEX_BATCH_SIZE)
+    batch: list[dict[str, Any]] = []
+    doc_count = 0
+    for item in iter_doc_items(okf_dir):
+        batch.append(item)
+        if len(batch) >= batch_size:
+            docs = docs_from_items(batch, model_key)
+            collection.insert(docs)
+            doc_count += len(docs)
+            batch.clear()
+    if batch:
+        docs = docs_from_items(batch, model_key)
         collection.insert(docs)
+        doc_count += len(docs)
+    if doc_count:
         collection.optimize()
         collection.flush()
-    return collection, len(docs)
+    return collection, doc_count
 
 
 def read_active_db_root(default_db_root: Path) -> Path:
@@ -1111,7 +1241,13 @@ def rollback_okf_activation(okf_dir: Path, backup: Path | None) -> None:
 def sync_okf_from_archive(archive: Path, okf_dir: Path, db_root: Path) -> dict[str, Any]:
     global _SEARCH_COLLECTIONS
 
-    with _SEARCH_LOCK:
+    if not _SYNC_LOCK.acquire(blocking=False):
+        raise RequestError(409, "синхронизация уже выполняется")
+    if _RESTART_REQUESTED.is_set():
+        _SYNC_LOCK.release()
+        raise RequestError(503, "сервис перезапускается")
+    _SYNC_IN_PROGRESS.set()
+    try:
         version = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         staged_okf: Path | None = None
         next_db_root = db_root.parent / f"{db_root.name}-{version}"
@@ -1146,27 +1282,25 @@ def sync_okf_from_archive(archive: Path, okf_dir: Path, db_root: Path) -> dict[s
             shutil.rmtree(staged_okf, ignore_errors=True)
             raise
 
-        old_collections = _SEARCH_COLLECTIONS
-        old_active_db_root = read_active_db_root(db_root)
-        backup_okf: Path | None = None
-        try:
-            backup_okf = activate_staged_okf(staged_okf, okf_dir, version)
-            write_active_db_root(next_db_root)
-        except Exception:
-            if backup_okf is not None:
-                rollback_okf_activation(okf_dir, backup_okf)
-            built.clear()
-            gc.collect()
-            shutil.rmtree(next_db_root, ignore_errors=True)
-            shutil.rmtree(staged_okf, ignore_errors=True)
-            with contextlib.suppress(Exception):
-                write_active_db_root(old_active_db_root)
-            raise
+        with _SEARCH_LOCK:
+            old_active_db_root = read_active_db_root(db_root)
+            backup_okf: Path | None = None
+            try:
+                backup_okf = activate_staged_okf(staged_okf, okf_dir, version)
+                write_active_db_root(next_db_root)
+            except Exception:
+                if backup_okf is not None:
+                    rollback_okf_activation(okf_dir, backup_okf)
+                built.clear()
+                gc.collect()
+                shutil.rmtree(next_db_root, ignore_errors=True)
+                shutil.rmtree(staged_okf, ignore_errors=True)
+                with contextlib.suppress(Exception):
+                    write_active_db_root(old_active_db_root)
+                raise
 
-        _SEARCH_COLLECTIONS = built
-        _QUERY_CACHE.clear()
-        old_collections.clear()
-        gc.collect()
+            _SEARCH_COLLECTIONS = built
+            clear_query_cache()
         if backup_okf is not None:
             shutil.rmtree(backup_okf, ignore_errors=True)
 
@@ -1177,6 +1311,9 @@ def sync_okf_from_archive(archive: Path, okf_dir: Path, db_root: Path) -> dict[s
             "models": response_models,
             "cleanup": cleanup,
         }
+    finally:
+        _SYNC_IN_PROGRESS.clear()
+        _SYNC_LOCK.release()
 
 
 def command_index(args: argparse.Namespace) -> None:
@@ -1298,7 +1435,7 @@ def command_benchmark(args: argparse.Namespace) -> None:
         for test in tests:
             query = str(test["query"])
             expected = str(test["expected_contains"])
-            _QUERY_CACHE.clear()
+            clear_query_cache()
             started = time.perf_counter()
             if args.service_url:
                 results = benchmark_http_search(
@@ -1343,7 +1480,7 @@ def command_benchmark(args: argparse.Namespace) -> None:
 
 
 class SearchHandler(BaseHTTPRequestHandler):
-    server_version = "OkfZvecSearch/1.0"
+    server_version = "OkfZvecSearch/0.4.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -1396,6 +1533,22 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
+
+    def send_request_error(self, exc: RequestError, request_id: str | None = None) -> None:
+        payload = {"error": exc.message}
+        headers = None
+        if request_id:
+            payload["request_id"] = request_id
+            headers = {"X-Request-Id": request_id}
+        self.send_json(exc.status, payload, headers)
+
+    def send_internal_error(self, request_id: str | None = None) -> None:
+        payload = {"error": "внутренняя ошибка сервиса"}
+        headers = None
+        if request_id:
+            payload["request_id"] = request_id
+            headers = {"X-Request-Id": request_id}
+        self.send_json(500, payload, headers)
 
     def send_search_unauthorized(self, wants_json: bool = False) -> None:
         headers = {"WWW-Authenticate": 'Basic realm="OKF Zvec Search", charset="UTF-8"'}
@@ -1628,7 +1781,10 @@ async function postAction(path, body) {{
   const response = await fetch(path, {{
     method: 'POST',
     credentials: 'same-origin',
-    headers: body ? {{'Content-Type': 'application/x-www-form-urlencoded'}} : {{}},
+    headers: {{
+      'X-OKF-Zvec-Action': '1',
+      ...(body ? {{'Content-Type': 'application/x-www-form-urlencoded'}} : {{}}),
+    }},
     body,
   }});
   if (!response.ok && response.status !== 202) {{
@@ -1715,27 +1871,51 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
         try:
             params = parse_qs(parsed.query)
             query = (params.get("q") or params.get("query") or [""])[0]
-            model_key = normalize_model_key((params.get("model") or [DEFAULT_MODEL])[0])
-            search_mode = normalize_search_mode((params.get("mode") or [DEFAULT_SEARCH_MODE])[0])
-            topk = int((params.get("topk") or ["5"])[0])
-            rerank_pool = int((params.get("rerank_pool") or ["50"])[0])
-            snippet = int((params.get("snippet") or ["220"])[0])
-            use_cache = (params.get("no_cache") or ["0"])[0] not in ("1", "true", "yes")
-            options = make_search_options(
-                semantic_weight=(
-                    float(params["semantic_weight"][0]) if params.get("semantic_weight") else None
-                ),
-                fts_weight=float(params["fts_weight"][0]) if params.get("fts_weight") else None,
-                min_relevance=(
-                    float(params["min_relevance"][0]) if params.get("min_relevance") else None
-                ),
-                doc_type=(params.get("type") or [""])[0],
-                tags=(params.get("tags") or [""])[0],
-                path_pattern=(params.get("path") or [""])[0],
-                project=(params.get("project") or [""])[0],
-                date_from=(params.get("date_from") or [""])[0],
-                date_to=(params.get("date_to") or [""])[0],
+            try:
+                model_key = normalize_model_key((params.get("model") or [DEFAULT_MODEL])[0])
+                search_mode = normalize_search_mode(
+                    (params.get("mode") or [DEFAULT_SEARCH_MODE])[0]
+                )
+            except ValueError as exc:
+                raise RequestError(400, str(exc)) from exc
+            topk = bounded_int((params.get("topk") or ["5"])[0], "topk", 1, MAX_TOPK)
+            rerank_pool = bounded_int(
+                (params.get("rerank_pool") or ["50"])[0],
+                "rerank_pool",
+                1,
+                MAX_RERANK_POOL,
             )
+            snippet = bounded_int(
+                (params.get("snippet") or ["220"])[0],
+                "snippet",
+                1,
+                MAX_SNIPPET,
+            )
+            use_cache = (params.get("no_cache") or ["0"])[0] not in ("1", "true", "yes")
+            try:
+                options = make_search_options(
+                    semantic_weight=(
+                        float(params["semantic_weight"][0])
+                        if params.get("semantic_weight")
+                        else None
+                    ),
+                    fts_weight=(
+                        float(params["fts_weight"][0]) if params.get("fts_weight") else None
+                    ),
+                    min_relevance=(
+                        float(params["min_relevance"][0])
+                        if params.get("min_relevance")
+                        else None
+                    ),
+                    doc_type=(params.get("type") or [""])[0],
+                    tags=(params.get("tags") or [""])[0],
+                    path_pattern=(params.get("path") or [""])[0],
+                    project=(params.get("project") or [""])[0],
+                    date_from=(params.get("date_from") or [""])[0],
+                    date_to=(params.get("date_to") or [""])[0],
+                )
+            except ValueError as exc:
+                raise RequestError(400, str(exc)) from exc
             collection = _SEARCH_COLLECTIONS.get(model_key)
             if collection is None:
                 raise RuntimeError(f"коллекция поиска не открыта для модели {model_key}")
@@ -1779,6 +1959,27 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                 result_count=len(results),
                 cache_enabled=use_cache,
             )
+        except RequestError as exc:
+            duration = time.perf_counter() - started
+            _METRICS.record_search(model_key, search_mode, "error", duration)
+            self.send_request_error(exc, request_id)
+        except ModelLoadError as exc:
+            duration = time.perf_counter() - started
+            _METRICS.record_search(model_key, search_mode, "error", duration)
+            log_event(
+                "search_failed",
+                level="error",
+                request_id=request_id,
+                model=model_key,
+                mode=search_mode,
+                duration_seconds=round(duration, 6),
+                error_type=type(exc).__name__,
+            )
+            self.send_json(
+                503,
+                {"error": "модель поиска временно недоступна", "request_id": request_id},
+                {"X-Request-Id": request_id},
+            )
         except Exception as exc:
             duration = time.perf_counter() - started
             _METRICS.record_search(model_key, search_mode, "error", duration)
@@ -1791,7 +1992,7 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                 duration_seconds=round(duration, 6),
                 error_type=type(exc).__name__,
             )
-            self.send_json(500, {"error": str(exc)}, {"X-Request-Id": request_id})
+            self.send_internal_error(request_id)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -1800,13 +2001,21 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                 self.send_search_unauthorized(wants_json=False)
                 return
             try:
+                if self.headers.get("X-OKF-Zvec-Action") != "1":
+                    raise RequestError(403, "недопустимый управляющий запрос")
                 if parsed.path == "/settings":
-                    length = int(self.headers.get("Content-Length", "0"))
+                    length = bounded_int(
+                        self.headers.get("Content-Length", "0"),
+                        "Content-Length",
+                        1,
+                        4096,
+                        413,
+                    )
                     body = self.rfile.read(length).decode("utf-8")
                     params = parse_qs(body)
                     value = (params.get("preload_models") or ["none"])[0]
-                    canonical, _ = save_preload_setting(value)
-                    apply_preload_setting(canonical)
+                    canonical, _ = apply_preload_setting(value)
+                    save_preload_setting(canonical)
                     self.send_redirect("/status")
                     return
                 if parsed.path == "/actions/reload-models":
@@ -1814,12 +2023,26 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                     self.send_redirect("/status")
                     return
 
+                if not _SYNC_LOCK.acquire(blocking=False):
+                    raise RequestError(409, "дождитесь завершения синхронизации")
+                try:
+                    if _SYNC_IN_PROGRESS.is_set():
+                        raise RequestError(409, "дождитесь завершения синхронизации")
+                    _RESTART_REQUESTED.set()
+                finally:
+                    _SYNC_LOCK.release()
                 log_event("service_restart_requested")
                 self.send_html(
                     202,
                     "<h1>Сервис перезапускается</h1><p>Обновите страницу через несколько секунд.</p>",
                 )
-                threading.Timer(0.25, lambda: os._exit(75)).start()
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+            except RequestError as exc:
+                self.send_request_error(exc)
+                return
+            except ModelLoadError:
+                self.send_json(503, {"error": "не удалось загрузить выбранные модели"})
                 return
             except Exception as exc:
                 log_event(
@@ -1828,7 +2051,7 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                     action=parsed.path,
                     error_type=type(exc).__name__,
                 )
-                self.send_json(500, {"error": str(exc)})
+                self.send_internal_error()
                 return
 
         if parsed.path != "/sync":
@@ -1840,10 +2063,15 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
 
         started = time.perf_counter()
         request_id = uuid.uuid4().hex
+        archive_path: Path | None = None
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0:
-                raise ValueError("пустое тело запроса")
+            length = bounded_int(
+                self.headers.get("Content-Length", "0"),
+                "Content-Length",
+                1,
+                env_int("OKF_ZVEC_MAX_SYNC_BYTES", DEFAULT_MAX_SYNC_BYTES),
+                413,
+            )
 
             with tempfile.NamedTemporaryFile(prefix="okf-upload-", suffix=".tgz", delete=False) as tmp:
                 archive_path = Path(tmp.name)
@@ -1854,15 +2082,14 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                         break
                     tmp.write(chunk)
                     remaining -= len(chunk)
+                if remaining:
+                    raise RequestError(400, "тело запроса получено не полностью")
 
-            try:
-                payload = sync_okf_from_archive(
-                    archive_path,
-                    self.server.okf_dir,
-                    self.server.db_dir,
-                )
-            finally:
-                archive_path.unlink(missing_ok=True)
+            payload = sync_okf_from_archive(
+                archive_path,
+                self.server.okf_dir,
+                self.server.db_dir,
+            )
             duration = time.perf_counter() - started
             _METRICS.record_sync("success", duration)
             with _STATE_LOCK:
@@ -1885,6 +2112,18 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                 skipped_versions=len(payload["cleanup"]["skipped"]),
             )
             self.send_json(200, payload, {"X-Request-Id": request_id})
+        except (tarfile.ReadError, UnicodeDecodeError):
+            duration = time.perf_counter() - started
+            _METRICS.record_sync("error", duration)
+            self.send_request_error(RequestError(400, "не удалось прочитать архив OKF"), request_id)
+        except ValueError as exc:
+            duration = time.perf_counter() - started
+            _METRICS.record_sync("error", duration)
+            self.send_request_error(RequestError(400, str(exc)), request_id)
+        except RequestError as exc:
+            duration = time.perf_counter() - started
+            _METRICS.record_sync("error", duration)
+            self.send_request_error(exc, request_id)
         except Exception as exc:
             duration = time.perf_counter() - started
             _METRICS.record_sync("error", duration)
@@ -1893,7 +2132,7 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                     "last_sync_at": datetime.now(timezone.utc).isoformat(),
                     "last_sync_status": "error",
                     "last_sync_duration_seconds": round(duration, 3),
-                    "last_sync_error": str(exc),
+                    "last_sync_error": "внутренняя ошибка сервиса",
                 })
             log_event(
                 "sync_failed",
@@ -1901,9 +2140,11 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                 request_id=request_id,
                 duration_seconds=round(duration, 3),
                 error_type=type(exc).__name__,
-                error=str(exc),
             )
-            self.send_json(500, {"error": str(exc)}, {"X-Request-Id": request_id})
+            self.send_internal_error(request_id)
+        finally:
+            if archive_path is not None:
+                archive_path.unlink(missing_ok=True)
 
 
 def command_serve(args: argparse.Namespace) -> None:
@@ -1955,6 +2196,9 @@ def command_serve(args: argparse.Namespace) -> None:
         preloaded_models=preload_models,
     )
     server.serve_forever()
+    server.server_close()
+    if _RESTART_REQUESTED.is_set():
+        raise SystemExit(75)
 
 
 def add_quality_arguments(parser: argparse.ArgumentParser, include_filters: bool = True) -> None:

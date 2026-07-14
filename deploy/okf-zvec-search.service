@@ -14,7 +14,7 @@ Environment=OKF_ZVEC_FTS_WEIGHT=1
 Environment=OKF_ZVEC_MIN_RELEVANCE=0.25
 Environment=OKF_ZVEC_PRELOAD_MODELS=e5
 WorkingDirectory=/opt/okf-zvec-search
-ExecStart=/opt/okf-zvec-search/.venv/bin/python /opt/okf-zvec-search/app/okf_zvec.py serve --host 0.0.0.0 --port 8765
+ExecStart=/opt/okf-zvec-search/.venv/bin/okf-zvec serve --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true

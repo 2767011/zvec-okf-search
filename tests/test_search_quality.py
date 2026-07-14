@@ -99,7 +99,10 @@ class SearchQualityTests(unittest.TestCase):
                 ][:topk]
 
         okf_zvec._QUERY_CACHE.clear()
-        with mock.patch.object(okf_zvec, "embed", return_value=[0.0] * okf_zvec.DIMENSION):
+        with (
+            mock.patch.object(okf_zvec, "get_model"),
+            mock.patch.object(okf_zvec, "embed", return_value=[0.0] * okf_zvec.DIMENSION),
+        ):
             results = okf_zvec.search_collection(
                 FakeCollection(),
                 "проверка",

@@ -80,6 +80,8 @@ class SyncTests(unittest.TestCase):
             old_collections = {"old": FakeCollection()}
 
             def successful_build(_okf, db_dir, _model_key):
+                self.assertTrue(okf_zvec._SEARCH_LOCK.acquire(blocking=False))
+                okf_zvec._SEARCH_LOCK.release()
                 db_dir.mkdir(parents=True, exist_ok=True)
                 return FakeCollection(), 1
 

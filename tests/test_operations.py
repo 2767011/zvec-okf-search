@@ -23,6 +23,9 @@ class FakeServer:
     def serve_forever(self):
         return None
 
+    def server_close(self):
+        return None
+
 
 class OperationsTests(unittest.TestCase):
     def test_search_auth_supports_basic_bearer_and_open_mode(self):

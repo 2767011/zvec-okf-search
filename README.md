@@ -33,7 +33,7 @@ Markdown-базе знаний в формате
 
 ```bash
 git clone https://github.com/2767011/zvec-okf-search.git
-cd okf-zvec-search
+cd zvec-okf-search
 sudo ./deploy/install.sh
 sudo systemctl enable --now okf-zvec-search
 ```
@@ -57,6 +57,9 @@ sudo systemctl enable --now okf-zvec-search
 ```text
 GET /health
 GET /models
+GET /status
+GET /status.json
+GET /metrics
 GET /search?q=портал&topk=5&model=e5&mode=hybrid
 POST /sync
 ```
@@ -102,6 +105,11 @@ HF_TOKEN
 Веса гибридного поиска и порог выдачи задаются через
 `OKF_ZVEC_SEMANTIC_WEIGHT`, `OKF_ZVEC_FTS_WEIGHT` и
 `OKF_ZVEC_MIN_RELEVANCE`. Порог находится в диапазоне от `0` до `1`.
+
+Ограничения синхронизации задаются переменными
+`OKF_ZVEC_MAX_SYNC_BYTES`, `OKF_ZVEC_MAX_EXTRACTED_BYTES` и
+`OKF_ZVEC_MAX_ARCHIVE_MEMBERS`. Размер партии индексации управляется через
+`OKF_ZVEC_INDEX_BATCH_SIZE`.
 
 Фильтры доступны в HTTP API, CLI и веб-интерфейсе:
 
@@ -211,8 +219,10 @@ okf-zvec benchmark \
 - Не добавляйте в Git токены сервиса и Hugging Face, закрытые базы OKF и
   сгенерированные индексы.
 - Ограничьте доступ к сервису межсетевым экраном или обратным прокси.
-  Эндпоинты поиска намеренно не требуют авторизации, а синхронизация защищена
-  токеном.
+  Если настроен поисковый токен, веб-интерфейс, поиск, состояние и метрики
+  требуют авторизацию. Синхронизация защищена отдельным сервисным токеном.
+- Для доступа через недоверенную сеть используйте HTTPS: Basic- и
+  Bearer-аутентификация сами по себе не шифруют токены.
 - При загрузке архива сервис проверяет пути и использует безопасный фильтр
   распаковки Python.
 
@@ -224,6 +234,9 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 python -m unittest discover -s tests -v
 ```
+
+В PowerShell окружение активируется командой
+`.\.venv\Scripts\Activate.ps1`.
 
 ## Лицензия
 

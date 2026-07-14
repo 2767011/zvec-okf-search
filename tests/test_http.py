@@ -1,0 +1,98 @@
+import http.client
+import json
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import okf_zvec
+
+
+class HttpTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.old_service_token = okf_zvec._SERVICE_TOKEN_FILE
+        self.old_search_token = okf_zvec._SEARCH_TOKEN_FILE
+        self.old_collections = okf_zvec._SEARCH_COLLECTIONS
+        okf_zvec._SERVICE_TOKEN_FILE = root / "service-token"
+        okf_zvec._SEARCH_TOKEN_FILE = root / "search-token"
+        okf_zvec._SEARCH_COLLECTIONS = {"e5": object()}
+        okf_zvec._SYNC_IN_PROGRESS.clear()
+
+        self.server = okf_zvec.ThreadingHTTPServer(("127.0.0.1", 0), okf_zvec.SearchHandler)
+        self.server.okf_dir = root / "okf"
+        self.server.db_dir = root / "db"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        okf_zvec._SERVICE_TOKEN_FILE = self.old_service_token
+        okf_zvec._SEARCH_TOKEN_FILE = self.old_search_token
+        okf_zvec._SEARCH_COLLECTIONS = self.old_collections
+        okf_zvec._SYNC_IN_PROGRESS.clear()
+        self.temporary.cleanup()
+
+    def request(self, method, path, body=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        connection.request(method, path, body=body, headers=headers or {})
+        response = connection.getresponse()
+        payload = response.read()
+        connection.close()
+        return response.status, json.loads(payload) if payload else {}
+
+    def test_search_rejects_out_of_range_topk(self):
+        status, payload = self.request("GET", "/search?q=test&topk=0")
+
+        self.assertEqual(status, 400)
+        self.assertIn("topk", payload["error"])
+
+    def test_browser_action_requires_custom_header(self):
+        status, payload = self.request("POST", "/actions/reload-models")
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "недопустимый управляющий запрос")
+
+    def test_restart_is_rejected_during_sync(self):
+        okf_zvec._SYNC_IN_PROGRESS.set()
+        status, payload = self.request(
+            "POST",
+            "/actions/restart",
+            headers={"X-OKF-Zvec-Action": "1"},
+        )
+
+        self.assertEqual(status, 409)
+        self.assertIn("синхронизации", payload["error"])
+
+    def test_internal_search_error_is_not_exposed(self):
+        with mock.patch.object(
+            okf_zvec,
+            "search_collection",
+            side_effect=RuntimeError("secret path /opt/private"),
+        ):
+            status, payload = self.request("GET", "/search?q=test")
+
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"], "внутренняя ошибка сервиса")
+        self.assertNotIn("private", json.dumps(payload))
+
+    def test_sync_rejects_oversized_body_before_reading(self):
+        okf_zvec._SERVICE_TOKEN_FILE.write_text("secret", encoding="utf-8")
+        with mock.patch.dict("os.environ", {"OKF_ZVEC_MAX_SYNC_BYTES": "4"}):
+            status, payload = self.request(
+                "POST",
+                "/sync",
+                body=b"12345",
+                headers={"X-OKF-Zvec-Token": "secret"},
+            )
+
+        self.assertEqual(status, 413)
+        self.assertIn("Content-Length", payload["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
