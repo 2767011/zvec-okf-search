@@ -251,6 +251,41 @@ def reload_preloaded_models() -> tuple[str, list[str]]:
     return canonical, models
 
 
+def update_loaded_model_state() -> list[str]:
+    with _MODEL_LOCK:
+        loaded_models = sorted(_MODELS)
+    with _STATE_LOCK:
+        for model_key in MODEL_CONFIGS:
+            state = _SERVICE_STATE["models"].setdefault(
+                model_key,
+                {"name": MODEL_CONFIGS[model_key]["name"]},
+            )
+            state["loaded"] = model_key in loaded_models
+    return loaded_models
+
+
+def load_model(model_key: str) -> None:
+    model_key = normalize_model_key(model_key)
+    get_model(model_key)
+    loaded_models = update_loaded_model_state()
+    log_event("model_loaded_by_action", model=model_key, loaded_models=loaded_models)
+
+
+def unload_model(model_key: str) -> None:
+    model_key = normalize_model_key(model_key)
+    with _SEARCH_LOCK:
+        with _MODEL_LOCK:
+            _MODELS.pop(model_key, None)
+        gc.collect()
+    loaded_models = update_loaded_model_state()
+    log_event("model_unloaded_by_action", model=model_key, loaded_models=loaded_models)
+
+
+def reload_model(model_key: str) -> None:
+    unload_model(model_key)
+    load_model(model_key)
+
+
 @dataclass(frozen=True)
 class SearchOptions:
     semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT
@@ -1480,7 +1515,7 @@ def command_benchmark(args: argparse.Namespace) -> None:
 
 
 class SearchHandler(BaseHTTPRequestHandler):
-    server_version = "OkfZvecSearch/0.4.0"
+    server_version = "OkfZvecSearch/0.4.1"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -1701,28 +1736,34 @@ function escapeHtml(value) {
 
     def render_status(self) -> str:
         state = status_snapshot()
+        _, preload_models = configured_preload_setting()
         model_rows = []
         for model_key, config in MODEL_CONFIGS.items():
             model_state = state["models"].get(model_key, {})
+            is_loaded = model_key in state["loaded_models"]
+            if is_loaded:
+                model_actions = (
+                    f'<a href="#" data-action="model-unload" data-model="{model_key}">Выгрузить</a> '
+                    f'<a href="#" data-action="model-reload" data-model="{model_key}">Перезагрузить</a>'
+                )
+            else:
+                model_actions = (
+                    f'<a href="#" data-action="model-load" data-model="{model_key}">Загрузить</a>'
+                )
             model_rows.append(
                 "<tr>"
                 f"<td>{html.escape(model_key)}</td>"
                 f"<td>{html.escape(config['name'])}</td>"
-                f"<td>{'да' if model_key in state['loaded_models'] else 'нет'}</td>"
+                f"<td>{'загружена' if is_loaded else 'не загружена'}</td>"
                 f"<td>{int(model_state.get('doc_count', 0))}</td>"
+                f"<td class=\"model-row-actions\">{model_actions}</td>"
                 "</tr>"
             )
-        preload_choices = (
-            ("none", "Не загружать заранее"),
-            ("e5", "E5"),
-            ("paraphrase", "Paraphrase MiniLM"),
-            ("all", "Обе модели"),
-        )
-        preload_options = "".join(
-            f'<option value="{value}"'
-            f'{" selected" if state["preload_models"] == value else ""}>'
-            f"{label}</option>"
-            for value, label in preload_choices
+        preload_checkboxes = "".join(
+            f'<label><input type="checkbox" name="preload_models" value="{model_key}"'
+            f'{" checked" if model_key in preload_models else ""}> '
+            f"{html.escape(MODEL_CONFIGS[model_key]['name'])}</label>"
+            for model_key in MODEL_CONFIGS
         )
         return f"""<!doctype html>
 <html lang="ru">
@@ -1737,8 +1778,11 @@ function escapeHtml(value) {
     th, td {{ text-align: left; padding: 10px; border: 1px solid #e2e8f0; }}
     dl {{ display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; }}
     dt {{ color: #64748b; }}
-    .model-settings {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
-    .model-actions {{ display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; }}
+    .model-settings {{ display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }}
+    .model-settings label {{ display: inline-flex; align-items: center; gap: 6px; }}
+    .model-row-actions {{ white-space: nowrap; }}
+    .model-row-actions a + a {{ margin-left: 12px; }}
+    .service-actions {{ margin-top: 14px; }}
     .action-status {{ color: #64748b; min-height: 24px; margin-top: 8px; }}
   </style>
 </head>
@@ -1756,21 +1800,18 @@ function escapeHtml(value) {
     <dt>Время работы</dt><dd>{float(state['uptime_seconds']):.1f} с</dd>
     <dt>Авторизация поиска</dt><dd>{'включена' if state['search_auth_enabled'] else 'отключена'}</dd>
   </dl>
-  <h2>Предзагрузка моделей</h2>
-  <form id="preloadForm" class="model-settings">
-    <select name="preload_models">{preload_options}</select>
-    <a href="#" data-action="apply">Применить</a>
-  </form>
-  <nav class="model-actions">
-    <a href="#" data-action="reload">Перезагрузить выбранные модели</a>
-    <a href="#" data-action="restart">Перезапустить сервис</a>
-  </nav>
-  <div id="actionStatus" class="action-status"></div>
-  <h2>Модели и индексы</h2>
+  <h2>Модели</h2>
   <table>
-    <thead><tr><th>Ключ</th><th>Модель</th><th>В памяти</th><th>Фрагментов</th></tr></thead>
+    <thead><tr><th>Ключ</th><th>Модель</th><th>В памяти</th><th>Фрагментов</th><th>Действие</th></tr></thead>
     <tbody>{''.join(model_rows)}</tbody>
   </table>
+  <h3>Автозагрузка после перезапуска</h3>
+  <form id="preloadForm" class="model-settings">
+    {preload_checkboxes}
+    <a href="#" data-action="save-preload">Сохранить и применить</a>
+  </form>
+  <p class="service-actions"><a href="#" data-action="restart">Перезапустить сервис</a></p>
+  <div id="actionStatus" class="action-status"></div>
 </main>
 <script>
 const actionStatus = document.getElementById('actionStatus');
@@ -1799,12 +1840,15 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
     event.preventDefault();
     try {{
       const action = link.dataset.action;
-      if (action === 'apply') {{
-        const body = new URLSearchParams(new FormData(preloadForm));
+      if (action === 'save-preload') {{
+        const selected = [...preloadForm.querySelectorAll('input[name="preload_models"]:checked')]
+          .map((input) => input.value);
+        const body = new URLSearchParams({{preload_models: selected.join(',')}});
         await postAction('/settings', body);
         window.location.reload();
-      }} else if (action === 'reload') {{
-        await postAction('/actions/reload-models');
+      }} else if (action === 'model-load' || action === 'model-unload' || action === 'model-reload') {{
+        const operation = action.replace('model-', '');
+        await postAction(`/models/${{link.dataset.model}}/${{operation}}`);
         window.location.reload();
       }} else {{
         await postAction('/actions/restart');
@@ -1996,7 +2040,8 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path in ("/settings", "/actions/reload-models", "/actions/restart"):
+        model_action = re.fullmatch(r"/models/([^/]+)/(load|unload|reload)", parsed.path)
+        if parsed.path in ("/settings", "/actions/reload-models", "/actions/restart") or model_action:
             if not is_search_authorized(self.headers):
                 self.send_search_unauthorized(wants_json=False)
                 return
@@ -2013,13 +2058,23 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                     )
                     body = self.rfile.read(length).decode("utf-8")
                     params = parse_qs(body)
-                    value = (params.get("preload_models") or ["none"])[0]
+                    value = ",".join(params.get("preload_models") or ["none"])
                     canonical, _ = apply_preload_setting(value)
                     save_preload_setting(canonical)
                     self.send_redirect("/status")
                     return
                 if parsed.path == "/actions/reload-models":
                     reload_preloaded_models()
+                    self.send_redirect("/status")
+                    return
+                if model_action:
+                    model_key, operation = model_action.groups()
+                    if operation == "load":
+                        load_model(model_key)
+                    elif operation == "unload":
+                        unload_model(model_key)
+                    else:
+                        reload_model(model_key)
                     self.send_redirect("/status")
                     return
 

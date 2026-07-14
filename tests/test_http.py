@@ -68,6 +68,17 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertIn("синхронизации", payload["error"])
 
+    def test_model_can_be_unloaded_individually(self):
+        with mock.patch.object(okf_zvec, "unload_model") as unload_model:
+            status, _ = self.request(
+                "POST",
+                "/models/e5/unload",
+                headers={"X-OKF-Zvec-Action": "1"},
+            )
+
+        self.assertEqual(status, 303)
+        unload_model.assert_called_once_with("e5")
+
     def test_internal_search_error_is_not_exposed(self):
         with mock.patch.object(
             okf_zvec,

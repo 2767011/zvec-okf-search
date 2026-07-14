@@ -119,10 +119,12 @@ class OperationsTests(unittest.TestCase):
             self.assertEqual(restored_models, ["e5"])
 
     def test_status_actions_are_rendered_as_links(self):
-        page = okf_zvec.SearchHandler.render_status(None)
+        with mock.patch.dict(okf_zvec._MODELS, {"e5": object()}, clear=True):
+            page = okf_zvec.SearchHandler.render_status(None)
 
-        self.assertIn('data-action="apply"', page)
-        self.assertIn('data-action="reload"', page)
+        self.assertIn('data-action="save-preload"', page)
+        self.assertIn('data-action="model-load"', page)
+        self.assertIn('data-action="model-unload"', page)
         self.assertIn('data-action="restart"', page)
         self.assertNotIn("<button", page)
 
