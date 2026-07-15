@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest import mock
 
@@ -136,6 +137,43 @@ class SearchQualityTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in results], ["strong"])
         self.assertAlmostEqual(results[0]["relevance"], 0.9)
+
+    def test_embedding_is_computed_before_search_lock(self):
+        embedding_started = threading.Event()
+        completed = threading.Event()
+
+        class FakeCollection:
+            def query(self, _query, topk, filter=None):
+                return [result("match", 0.1)][:topk]
+
+        def fake_embed(*_args, **_kwargs):
+            embedding_started.set()
+            return [0.0] * okf_zvec.DIMENSION
+
+        def run_search():
+            try:
+                okf_zvec.search_collection(
+                    FakeCollection(),
+                    "проверка",
+                    topk=1,
+                    rerank_pool=1,
+                    search_mode="semantic",
+                    use_cache=False,
+                )
+            finally:
+                completed.set()
+
+        okf_zvec._SEARCH_LOCK.acquire()
+        try:
+            with mock.patch.object(okf_zvec, "embed", side_effect=fake_embed):
+                thread = threading.Thread(target=run_search)
+                thread.start()
+                self.assertTrue(embedding_started.wait(timeout=2))
+                self.assertFalse(completed.is_set())
+        finally:
+            okf_zvec._SEARCH_LOCK.release()
+        thread.join(timeout=2)
+        self.assertTrue(completed.is_set())
 
 
 if __name__ == "__main__":

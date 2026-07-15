@@ -1,6 +1,7 @@
 import gc
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import zvec
@@ -87,7 +88,14 @@ class ZvecIntegrationTests(unittest.TestCase):
         )
         self.assertEqual([item.id for item in filtered], ["side"])
 
-        del filtered, results, collection
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            concurrent_results = list(
+                executor.map(lambda _: collection.query(query, topk=1)[0].id, range(20))
+            )
+        self.assertEqual(concurrent_results, ["same"] * 20)
+
+        del concurrent_results, filtered, results
+        collection = None
         gc.collect()
         temporary.cleanup()
 

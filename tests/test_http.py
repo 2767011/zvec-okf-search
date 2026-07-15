@@ -85,6 +85,12 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("topk", payload["error"])
 
+    def test_search_rejects_model_without_index(self):
+        status, payload = self.request("GET", "/search?q=test&model=paraphrase")
+
+        self.assertEqual(status, 400)
+        self.assertIn("индекс модели", payload["error"])
+
     def test_browser_action_requires_custom_header(self):
         status, payload = self.request("POST", "/actions/reload-models")
 

@@ -16,6 +16,7 @@ Environment=OKF_ZVEC_SEMANTIC_WEIGHT=1
 Environment=OKF_ZVEC_FTS_WEIGHT=1
 Environment=OKF_ZVEC_MIN_RELEVANCE=0.25
 Environment=OKF_ZVEC_PRELOAD_MODELS=e5
+Environment=OKF_ZVEC_INDEX_MODELS=e5
 WorkingDirectory=/opt/okf-zvec-search
 User=okf-zvec
 Group=okf-zvec

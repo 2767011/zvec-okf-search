@@ -4,7 +4,7 @@ param(
     [string]$ServiceUrl = "http://127.0.0.1:8765",
     [ValidateSet("e5", "paraphrase")]
     [string]$Model = "e5",
-    [ValidateSet("semantic", "fts", "hybrid")]
+    [ValidateSet("semantic", "fts", "fts_raw", "hybrid")]
     [string]$Mode = "hybrid",
     [ValidateRange(1, 100)]
     [int]$TopK = 5,

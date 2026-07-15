@@ -29,6 +29,17 @@ class FakeServer:
 
 
 class OperationsTests(unittest.TestCase):
+    def test_index_models_are_configurable(self):
+        with mock.patch.dict("os.environ", {"OKF_ZVEC_INDEX_MODELS": "e5"}):
+            self.assertEqual(okf_zvec.configured_index_models(), ["e5"])
+
+    def test_home_only_offers_indexed_models(self):
+        with mock.patch.dict(okf_zvec._SEARCH_COLLECTIONS, {"e5": object()}, clear=True):
+            page = okf_zvec.SearchHandler.render_home(None)
+
+        self.assertIn('value="e5"', page)
+        self.assertNotIn('value="paraphrase"', page)
+
     def test_search_auth_supports_basic_bearer_and_explicit_anonymous_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             token_file = Path(tmp) / "search-token"

@@ -43,7 +43,7 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 DIMENSION = 384
 DEFAULT_MODEL = "e5"
 DEFAULT_SEARCH_MODE = "hybrid"
-SEARCH_MODES = ("semantic", "fts", "hybrid")
+SEARCH_MODES = ("semantic", "fts", "fts_raw", "hybrid")
 APP_HOME = Path(os.environ.get("OKF_ZVEC_HOME", "/opt/okf-zvec-search"))
 DEFAULT_OKF_DIR = APP_HOME / "data" / "okf"
 DEFAULT_DB_ROOT = APP_HOME / "data" / "db"
@@ -200,9 +200,19 @@ def normalize_preload_setting(value: str) -> tuple[str, list[str]]:
         return "none", []
     if normalized in ("1", "true", "yes", "all"):
         return "all", list(MODEL_CONFIGS)
-    models = [normalize_model_key(item.strip()) for item in normalized.split(",") if item.strip()]
+    models = list(dict.fromkeys(
+        normalize_model_key(item.strip()) for item in normalized.split(",") if item.strip()
+    ))
     canonical = ",".join(models)
     return canonical, models
+
+
+def configured_index_models() -> list[str]:
+    value = os.environ.get("OKF_ZVEC_INDEX_MODELS", "all")
+    _, models = normalize_preload_setting(value)
+    if not models:
+        raise ValueError("OKF_ZVEC_INDEX_MODELS должен содержать хотя бы одну модель")
+    return models
 
 
 def configured_preload_setting() -> tuple[str, list[str]]:
@@ -230,6 +240,9 @@ def save_preload_setting(value: str) -> tuple[str, list[str]]:
 
 def apply_preload_setting(value: str, unload_others: bool = True) -> tuple[str, list[str]]:
     canonical, models = normalize_preload_setting(value)
+    unavailable = [model for model in models if model not in configured_index_models()]
+    if unavailable:
+        raise ValueError("предзагрузка требует включённого индекса: " + ", ".join(unavailable))
     for model_key in models:
         get_model(model_key)
     with _SEARCH_LOCK:
@@ -418,6 +431,12 @@ def normalize_search_mode(search_mode: str | None) -> str:
     if mode not in SEARCH_MODES:
         raise ValueError(f"неизвестный режим '{search_mode}'; доступно: {', '.join(SEARCH_MODES)}")
     return mode
+
+
+def service_default_model() -> str:
+    if DEFAULT_MODEL in _SEARCH_COLLECTIONS:
+        return DEFAULT_MODEL
+    return next(iter(_SEARCH_COLLECTIONS), DEFAULT_MODEL)
 
 
 def get_model(model_key: str = DEFAULT_MODEL) -> Any:
@@ -617,6 +636,7 @@ def iter_doc_items(okf_dir: Path) -> Iterator[dict[str, Any]]:
                 "text": chunk,
                 "search_text": search_text,
                 "fts_text": normalize_fts_text(search_text),
+                "fts_raw_text": normalize_raw_fts_text(search_text),
             }
 
 
@@ -645,6 +665,7 @@ def docs_from_items(items: list[dict[str, Any]], model_key: str) -> list[zvec.Do
                     "filter_timestamp": item["timestamp"],
                     "text": item["text"],
                     "search_text": item["fts_text"],
+                    "search_text_raw": item["fts_raw_text"],
                 },
             )
         )
@@ -699,6 +720,12 @@ def create_schema() -> zvec.CollectionSchema:
             ),
             zvec.FieldSchema(
                 "search_text",
+                zvec.DataType.STRING,
+                nullable=False,
+                index_param=zvec.FtsIndexParam(tokenizer_name="whitespace", filters=["lowercase"]),
+            ),
+            zvec.FieldSchema(
+                "search_text_raw",
                 zvec.DataType.STRING,
                 nullable=False,
                 index_param=zvec.FtsIndexParam(tokenizer_name="whitespace", filters=["lowercase"]),
@@ -769,6 +796,10 @@ def lexical_tokens(text: str) -> set[str]:
 
 def normalize_fts_text(text: str) -> str:
     return " ".join(token_lemma(token) for token in TOKEN_RE.findall(text.casefold()))
+
+
+def normalize_raw_fts_text(text: str) -> str:
+    return " ".join(token.casefold() for token in TOKEN_RE.findall(text))
 
 
 def result_matches_filters(fields: dict[str, Any], options: SearchOptions) -> bool:
@@ -955,20 +986,25 @@ def search_collection(
     filter_expression = build_zvec_filter(options)
     semantic_results: list[Any] = []
     fts_results: list[Any] = []
+    vector_query: Any | None = None
     if search_mode in ("semantic", "hybrid") and options.semantic_weight > 0:
-        get_model(model_key)
+        vector_query = zvec.Query("embedding", vector=embed(query, model_key, kind="query"))
     with _SEARCH_LOCK:
-        if search_mode in ("semantic", "hybrid") and options.semantic_weight > 0:
-            vector_query = zvec.Query("embedding", vector=embed(query, model_key, kind="query"))
+        if vector_query is not None:
             semantic_results = collection.query(
                 vector_query,
                 topk=pool_size,
                 filter=filter_expression,
             )
-        if search_mode in ("fts", "hybrid") and options.fts_weight > 0:
+        if search_mode in ("fts", "fts_raw", "hybrid") and options.fts_weight > 0:
+            raw_fts = search_mode == "fts_raw"
             fts_query = zvec.Query(
-                "search_text",
-                fts=zvec.Fts(match_string=normalize_fts_text(query)),
+                "search_text_raw" if raw_fts else "search_text",
+                fts=zvec.Fts(
+                    match_string=(
+                        normalize_raw_fts_text(query) if raw_fts else normalize_fts_text(query)
+                    )
+                ),
             )
             fts_results = collection.query(
                 fts_query,
@@ -996,7 +1032,7 @@ def search_collection(
             }
             for result in semantic_results
         ]
-    elif search_mode == "fts":
+    elif search_mode in ("fts", "fts_raw"):
         ranked = [
             {
                 "result": result,
@@ -1204,6 +1240,7 @@ def status_snapshot() -> dict[str, Any]:
         "retained_versions": keep_versions(),
         "search_auth_enabled": bool(search_token()),
         "preload_models": preload_setting,
+        "indexed_models": list(_SEARCH_COLLECTIONS),
     })
     return state
 
@@ -1454,7 +1491,7 @@ def sync_okf_from_archive(archive: Path, okf_dir: Path, db_root: Path) -> dict[s
             staged_okf = stage_okf_directory(uploaded_okf, okf_dir, version)
 
         try:
-            for model_key in MODEL_CONFIGS:
+            for model_key in configured_index_models():
                 collection, doc_count = build_index(
                     staged_okf,
                     model_db_dir(next_db_root, model_key),
@@ -1491,7 +1528,12 @@ def sync_okf_from_archive(archive: Path, okf_dir: Path, db_root: Path) -> dict[s
                 raise
 
             _SEARCH_COLLECTIONS = built
+            with _MODEL_LOCK:
+                for model_key in list(_MODELS):
+                    if model_key not in built:
+                        _MODELS.pop(model_key, None)
             clear_query_cache()
+            gc.collect()
         if backup_okf is not None:
             shutil.rmtree(backup_okf, ignore_errors=True)
 
@@ -1702,7 +1744,7 @@ def command_benchmark(args: argparse.Namespace) -> None:
 
 
 class SearchHandler(BaseHTTPRequestHandler):
-    server_version = "OkfZvecSearch/0.5.1"
+    server_version = "OkfZvecSearch/0.6.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -1813,7 +1855,11 @@ class SearchHandler(BaseHTTPRequestHandler):
         })
 
     def render_home(self) -> str:
-        return r"""<!doctype html>
+        model_options = "".join(
+            f'<option value="{model_key}">{html.escape(MODEL_CONFIGS[model_key]["name"])}</option>'
+            for model_key in _SEARCH_COLLECTIONS
+        )
+        page = r"""<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
@@ -1850,13 +1896,13 @@ class SearchHandler(BaseHTTPRequestHandler):
     <div class="search-row">
       <input id="query" type="text" placeholder="миграция, портал поставщиков, прошивка кассы" autofocus>
       <select id="model">
-        <option value="e5">многоязычная E5 small</option>
-        <option value="paraphrase">многоязычная paraphrase MiniLM</option>
+        __MODEL_OPTIONS__
       </select>
       <select id="mode">
         <option value="hybrid">Семантика + FTS</option>
         <option value="semantic">Только семантика</option>
         <option value="fts">Только FTS</option>
+        <option value="fts_raw">FTS без лемматизации</option>
       </select>
       <input id="topk" type="number" min="1" max="20" value="5" title="Количество результатов">
       <button type="submit">Найти</button>
@@ -1953,6 +1999,7 @@ function escapeHtml(value) {
 </script>
 </body>
 </html>"""
+        return page.replace("__MODEL_OPTIONS__", model_options)
 
     def render_ai_history(self) -> str:
         history = ai_history_snapshot()
@@ -2042,7 +2089,10 @@ function escapeHtml(value) {
         for model_key, config in MODEL_CONFIGS.items():
             model_state = state["models"].get(model_key, {})
             is_loaded = model_key in state["loaded_models"]
-            if is_loaded:
+            is_indexed = model_key in _SEARCH_COLLECTIONS
+            if not is_indexed:
+                model_actions = "индекс отключён"
+            elif is_loaded:
                 model_actions = (
                     f'<a href="#" data-action="model-unload" data-model="{model_key}">Выгрузить</a> '
                     f'<a href="#" data-action="model-reload" data-model="{model_key}">Перезагрузить</a>'
@@ -2055,7 +2105,7 @@ function escapeHtml(value) {
                 "<tr>"
                 f"<td>{html.escape(model_key)}</td>"
                 f"<td>{html.escape(config['name'])}</td>"
-                f"<td>{'загружена' if is_loaded else 'не загружена'}</td>"
+                f"<td>{'нет индекса' if not is_indexed else ('загружена' if is_loaded else 'не загружена')}</td>"
                 f"<td>{int(model_state.get('doc_count', 0))}</td>"
                 f"<td class=\"model-row-actions\">{model_actions}</td>"
                 "</tr>"
@@ -2064,7 +2114,7 @@ function escapeHtml(value) {
             f'<label><input type="checkbox" name="preload_models" value="{model_key}"'
             f'{" checked" if model_key in preload_models else ""}> '
             f"{html.escape(MODEL_CONFIGS[model_key]['name'])}</label>"
-            for model_key in MODEL_CONFIGS
+            for model_key in _SEARCH_COLLECTIONS
         )
         return f"""<!doctype html>
 <html lang="ru">
@@ -2182,8 +2232,10 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                 200,
                 {
                     "ok": True,
-                    "default_model": DEFAULT_MODEL,
-                    "models": {key: value["name"] for key, value in MODEL_CONFIGS.items()},
+                    "default_model": service_default_model(),
+                    "models": {
+                        key: MODEL_CONFIGS[key]["name"] for key in _SEARCH_COLLECTIONS
+                    },
                 },
             )
             return
@@ -2209,9 +2261,10 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
             self.send_json(
                 200,
                 {
-                    "default_model": DEFAULT_MODEL,
+                    "default_model": service_default_model(),
                     "models": [
-                        {"key": key, "name": value["name"]} for key, value in MODEL_CONFIGS.items()
+                        {"key": key, "name": MODEL_CONFIGS[key]["name"]}
+                        for key in _SEARCH_COLLECTIONS
                     ],
                 },
             )
@@ -2229,7 +2282,9 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
             params = parse_qs(parsed.query)
             query = (params.get("q") or params.get("query") or [""])[0]
             try:
-                model_key = normalize_model_key((params.get("model") or [DEFAULT_MODEL])[0])
+                model_key = normalize_model_key(
+                    (params.get("model") or [service_default_model()])[0]
+                )
                 search_mode = normalize_search_mode(
                     (params.get("mode") or [DEFAULT_SEARCH_MODE])[0]
                 )
@@ -2275,7 +2330,7 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                 raise RequestError(400, str(exc)) from exc
             collection = _SEARCH_COLLECTIONS.get(model_key)
             if collection is None:
-                raise RuntimeError(f"коллекция поиска не открыта для модели {model_key}")
+                raise RequestError(400, f"индекс модели {model_key} не настроен")
             results = search_collection(
                 collection,
                 query,
@@ -2412,6 +2467,8 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                     return
                 if model_action:
                     model_key, operation = model_action.groups()
+                    if normalize_model_key(model_key) not in _SEARCH_COLLECTIONS:
+                        raise RequestError(400, f"индекс модели {model_key} не настроен")
                     if operation == "load":
                         load_model(model_key)
                     elif operation == "unload":
@@ -2501,6 +2558,9 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                     "last_sync_error": "",
                     "active_db_root": payload["active_db_root"],
                 })
+                for model_key in MODEL_CONFIGS:
+                    model_state = _SERVICE_STATE["models"].setdefault(model_key, {})
+                    model_state["doc_count"] = 0
                 for model_key, model in payload["models"].items():
                     model_state = _SERVICE_STATE["models"].setdefault(model_key, {})
                     model_state["doc_count"] = int(model["doc_count"])
@@ -2554,7 +2614,8 @@ def command_serve(args: argparse.Namespace) -> None:
     db_root = Path(args.db).resolve()
     active_db_root = read_active_db_root(db_root)
     collections: dict[str, Any] = {}
-    for model_key in MODEL_CONFIGS:
+    index_models = configured_index_models()
+    for model_key in index_models:
         db_dir = model_db_dir(active_db_root, model_key)
         if not db_dir.exists():
             build_index(Path(args.okf).resolve(), db_dir, model_key)
@@ -2566,6 +2627,11 @@ def command_serve(args: argparse.Namespace) -> None:
     _SEARCH_COLLECTIONS = collections
 
     preload_value, preload_models = configured_preload_setting()
+    unavailable_preloads = [model for model in preload_models if model not in collections]
+    if unavailable_preloads:
+        raise ValueError(
+            "предзагрузка требует включённого индекса: " + ", ".join(unavailable_preloads)
+        )
     for model_key in preload_models:
         get_model(model_key)
 
@@ -2595,6 +2661,7 @@ def command_serve(args: argparse.Namespace) -> None:
         search_auth_enabled=bool(search_token()),
         preload_setting=preload_value,
         preloaded_models=preload_models,
+        indexed_models=index_models,
     )
     server.serve_forever()
     server.server_close()
@@ -2641,7 +2708,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument("--service-url", help="HTTP-адрес запущенного сервиса")
     benchmark_parser.add_argument("--token-file", help="файл токена поискового API")
     benchmark_parser.add_argument("--model", default=DEFAULT_MODEL, choices=list(MODEL_CONFIGS.keys()))
-    benchmark_parser.add_argument("--modes", default="semantic,fts,hybrid")
+    benchmark_parser.add_argument("--modes", default="semantic,fts_raw,fts,hybrid")
     benchmark_parser.add_argument("--topk", type=int, default=5)
     benchmark_parser.add_argument("--rerank-pool", type=int, default=50)
     add_quality_arguments(benchmark_parser, include_filters=False)

@@ -52,17 +52,25 @@ chmod 0600 \
   "${APP_HOME}/config/admin-token"
 echo "Токены сохранены в ${APP_HOME}/config/."
 
+INDEX_MODELS="${OKF_ZVEC_INDEX_MODELS:-e5}"
 runuser -u "${SERVICE_USER}" -- env \
   HOME="${APP_HOME}" \
   HF_HOME="${APP_HOME}/data/huggingface" \
   OKF_ZVEC_HOME="${APP_HOME}" \
+  OKF_ZVEC_INDEX_MODELS="${INDEX_MODELS}" \
   "${APP_HOME}/.venv/bin/python" - <<'PY'
+import os
 from sentence_transformers import SentenceTransformer
 
-for name in (
-    "intfloat/multilingual-e5-small",
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-):
+models = {
+    "e5": "intfloat/multilingual-e5-small",
+    "paraphrase": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+}
+keys = models if os.environ["OKF_ZVEC_INDEX_MODELS"].casefold() == "all" else (
+    key.strip() for key in os.environ["OKF_ZVEC_INDEX_MODELS"].split(",")
+)
+for key in keys:
+    name = models[key]
     model = SentenceTransformer(name)
     print(name, model.get_sentence_embedding_dimension())
 PY

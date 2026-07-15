@@ -26,6 +26,10 @@ class TextProcessingTests(unittest.TestCase):
         normalized = okf_zvec.normalize_fts_text("Портал: поставщиками!")
         self.assertEqual(normalized, "портал поставщик")
 
+    def test_raw_fts_preserves_russian_word_forms(self):
+        normalized = okf_zvec.normalize_raw_fts_text("Поставщиками и поставщиков")
+        self.assertEqual(normalized, "поставщиками и поставщиков")
+
 
 if __name__ == "__main__":
     unittest.main()
