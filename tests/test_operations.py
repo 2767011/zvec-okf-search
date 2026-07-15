@@ -28,12 +28,16 @@ class FakeServer:
 
 
 class OperationsTests(unittest.TestCase):
-    def test_search_auth_supports_basic_bearer_and_open_mode(self):
+    def test_search_auth_supports_basic_bearer_and_explicit_anonymous_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             token_file = Path(tmp) / "search-token"
             headers = {}
             with mock.patch.object(okf_zvec, "_SEARCH_TOKEN_FILE", token_file):
-                self.assertTrue(okf_zvec.is_search_authorized(headers))
+                self.assertFalse(okf_zvec.is_search_authorized(headers))
+                with mock.patch.dict(
+                    "os.environ", {"OKF_ZVEC_ALLOW_ANONYMOUS_SEARCH": "true"}
+                ):
+                    self.assertTrue(okf_zvec.is_search_authorized(headers))
 
                 token_file.write_text("secret", encoding="utf-8")
                 basic = base64.b64encode(b"okf:secret").decode("ascii")

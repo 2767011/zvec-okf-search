@@ -66,6 +66,21 @@ class SearchQualityTests(unittest.TestCase):
             )
         )
 
+        expression = okf_zvec.build_zvec_filter(options)
+        self.assertIn('filter_type = "software-project"', expression)
+        self.assertIn('filter_tags CONTAIN_ALL ("zvec")', expression)
+        self.assertIn('filter_path LIKE "topics/%"', expression)
+
+        exact_path = okf_zvec.build_zvec_filter(
+            okf_zvec.SearchOptions(path_pattern="topics/my_note.md")
+        )
+        self.assertEqual(exact_path, 'filter_path = "topics/my_note.md"')
+
+    def test_hybrid_relevance_uses_only_available_signals(self):
+        options = okf_zvec.SearchOptions(semantic_weight=0.7, fts_weight=0.3)
+        item = {"semantic_score": None, "fts_score": 3.0}
+        self.assertAlmostEqual(okf_zvec.hybrid_relevance(item, options), 0.75)
+
     def test_relevance_is_normalized(self):
         self.assertAlmostEqual(okf_zvec.semantic_relevance(0.2), 0.8)
         self.assertAlmostEqual(okf_zvec.fts_relevance(3.0), 0.75)
@@ -90,9 +105,16 @@ class SearchQualityTests(unittest.TestCase):
         self.assertEqual(okf_zvec.benchmark_rank(results, "POS Center"), 2)
         self.assertEqual(okf_zvec.benchmark_rank(results, "Отсутствует"), 0)
 
+    def test_benchmark_metrics_support_multiple_relevant_results(self):
+        recall, ndcg = okf_zvec.benchmark_ranking_metrics([1, 3, 0], topk=3)
+        self.assertAlmostEqual(recall, 2 / 3)
+        self.assertGreater(ndcg, 0.6)
+        self.assertLess(ndcg, 1.0)
+
     def test_relevance_threshold_removes_weak_results(self):
         class FakeCollection:
-            def query(self, _query, topk):
+            def query(self, _query, topk, filter=None):
+                self.filter = filter
                 return [
                     result("strong", 0.1),
                     result("weak", 0.8),

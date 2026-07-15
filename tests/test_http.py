@@ -15,9 +15,13 @@ class HttpTests(unittest.TestCase):
         root = Path(self.temporary.name)
         self.old_service_token = okf_zvec._SERVICE_TOKEN_FILE
         self.old_search_token = okf_zvec._SEARCH_TOKEN_FILE
+        self.old_admin_token = okf_zvec._ADMIN_TOKEN_FILE
         self.old_collections = okf_zvec._SEARCH_COLLECTIONS
         okf_zvec._SERVICE_TOKEN_FILE = root / "service-token"
         okf_zvec._SEARCH_TOKEN_FILE = root / "search-token"
+        okf_zvec._ADMIN_TOKEN_FILE = root / "admin-token"
+        okf_zvec._SEARCH_TOKEN_FILE.write_text("search-secret", encoding="utf-8")
+        okf_zvec._ADMIN_TOKEN_FILE.write_text("admin-secret", encoding="utf-8")
         okf_zvec._SEARCH_COLLECTIONS = {"e5": object()}
         okf_zvec._SYNC_IN_PROGRESS.clear()
 
@@ -33,17 +37,47 @@ class HttpTests(unittest.TestCase):
         self.thread.join(timeout=5)
         okf_zvec._SERVICE_TOKEN_FILE = self.old_service_token
         okf_zvec._SEARCH_TOKEN_FILE = self.old_search_token
+        okf_zvec._ADMIN_TOKEN_FILE = self.old_admin_token
         okf_zvec._SEARCH_COLLECTIONS = self.old_collections
         okf_zvec._SYNC_IN_PROGRESS.clear()
         self.temporary.cleanup()
 
-    def request(self, method, path, body=None, headers=None):
+    def request(self, method, path, body=None, headers=None, authorized=True):
+        request_headers = dict(headers or {})
+        if authorized:
+            request_headers.setdefault("X-OKF-Zvec-Search-Token", "search-secret")
+            request_headers.setdefault("X-OKF-Zvec-Admin-Token", "admin-secret")
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
-        connection.request(method, path, body=body, headers=headers or {})
+        connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         payload = response.read()
         connection.close()
         return response.status, json.loads(payload) if payload else {}
+
+    def test_search_fails_closed_without_token(self):
+        status, payload = self.request("GET", "/search?q=test", authorized=False)
+
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"], "требуется авторизация")
+
+    def test_anonymous_search_requires_explicit_setting(self):
+        okf_zvec._SEARCH_TOKEN_FILE.unlink()
+        with mock.patch.dict("os.environ", {"OKF_ZVEC_ALLOW_ANONYMOUS_SEARCH": "1"}):
+            status, payload = self.request("GET", "/search?q=test&topk=0", authorized=False)
+
+        self.assertEqual(status, 400)
+        self.assertIn("topk", payload["error"])
+
+    def test_control_action_requires_separate_admin_token(self):
+        status, payload = self.request(
+            "POST",
+            "/actions/reload-models",
+            headers={"X-OKF-Zvec-Search-Token": "search-secret"},
+            authorized=False,
+        )
+
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"], "требуется токен администратора")
 
     def test_search_rejects_out_of_range_topk(self):
         status, payload = self.request("GET", "/search?q=test&topk=0")
@@ -78,6 +112,16 @@ class HttpTests(unittest.TestCase):
 
         self.assertEqual(status, 303)
         unload_model.assert_called_once_with("e5")
+
+    def test_unknown_model_action_is_a_client_error(self):
+        status, payload = self.request(
+            "POST",
+            "/models/unknown/load",
+            headers={"X-OKF-Zvec-Action": "1"},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("неизвестная модель", payload["error"])
 
     def test_internal_search_error_is_not_exposed(self):
         with mock.patch.object(

@@ -8,14 +8,20 @@ fi
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_HOME="${OKF_ZVEC_HOME:-/opt/okf-zvec-search}"
+SERVICE_USER="okf-zvec"
 
 apt-get update
 apt-get install -y python3 python3-venv ca-certificates openssl
 
+if ! getent passwd "${SERVICE_USER}" >/dev/null; then
+  useradd --system --home-dir "${APP_HOME}" --shell /usr/sbin/nologin "${SERVICE_USER}"
+fi
+
 install -d -m 0755 \
   "${APP_HOME}/config" \
   "${APP_HOME}/data/okf" \
-  "${APP_HOME}/data/db"
+  "${APP_HOME}/data/db" \
+  "${APP_HOME}/data/huggingface"
 
 python3 -m venv "${APP_HOME}/.venv"
 "${APP_HOME}/.venv/bin/pip" install --upgrade pip
@@ -36,9 +42,21 @@ if [[ ! -s "${APP_HOME}/config/search-token" ]]; then
   openssl rand -hex 32 > "${APP_HOME}/config/search-token"
   chmod 0600 "${APP_HOME}/config/search-token"
 fi
+if [[ ! -s "${APP_HOME}/config/admin-token" ]]; then
+  openssl rand -hex 32 > "${APP_HOME}/config/admin-token"
+fi
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_HOME}/config" "${APP_HOME}/data"
+chmod 0600 \
+  "${APP_HOME}/config/service-token" \
+  "${APP_HOME}/config/search-token" \
+  "${APP_HOME}/config/admin-token"
 echo "Токены сохранены в ${APP_HOME}/config/."
 
-OKF_ZVEC_HOME="${APP_HOME}" "${APP_HOME}/.venv/bin/python" - <<'PY'
+runuser -u "${SERVICE_USER}" -- env \
+  HOME="${APP_HOME}" \
+  HF_HOME="${APP_HOME}/data/huggingface" \
+  OKF_ZVEC_HOME="${APP_HOME}" \
+  "${APP_HOME}/.venv/bin/python" - <<'PY'
 from sentence_transformers import SentenceTransformer
 
 for name in (

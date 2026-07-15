@@ -8,17 +8,25 @@ Type=simple
 EnvironmentFile=-/etc/okf-zvec-search.env
 Environment=OKF_ZVEC_HOME=/opt/okf-zvec-search
 Environment=OKF_ZVEC_SEARCH_TOKEN_FILE=/opt/okf-zvec-search/config/search-token
+Environment=OKF_ZVEC_ADMIN_TOKEN_FILE=/opt/okf-zvec-search/config/admin-token
+Environment=HF_HOME=/opt/okf-zvec-search/data/huggingface
 Environment=OKF_ZVEC_KEEP_VERSIONS=3
 Environment=OKF_ZVEC_SEMANTIC_WEIGHT=1
 Environment=OKF_ZVEC_FTS_WEIGHT=1
 Environment=OKF_ZVEC_MIN_RELEVANCE=0.25
 Environment=OKF_ZVEC_PRELOAD_MODELS=e5
 WorkingDirectory=/opt/okf-zvec-search
+User=okf-zvec
+Group=okf-zvec
 ExecStart=/opt/okf-zvec-search/.venv/bin/okf-zvec serve --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/okf-zvec-search/config /opt/okf-zvec-search/data
 
 [Install]
 WantedBy=multi-user.target

@@ -11,10 +11,12 @@ import fnmatch
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import secrets
 import shutil
+import sys
 import tarfile
 import threading
 import tempfile
@@ -76,6 +78,9 @@ _SERVICE_TOKEN_FILE = Path(
 )
 _SEARCH_TOKEN_FILE = Path(
     os.environ.get("OKF_ZVEC_SEARCH_TOKEN_FILE", str(APP_HOME / "config" / "search-token"))
+)
+_ADMIN_TOKEN_FILE = Path(
+    os.environ.get("OKF_ZVEC_ADMIN_TOKEN_FILE", str(APP_HOME / "config" / "admin-token"))
 )
 _ACTIVE_DB_FILE = Path(
     os.environ.get("OKF_ZVEC_ACTIVE_DB_FILE", str(APP_HOME / "data" / "active-db-root"))
@@ -623,6 +628,11 @@ def docs_from_items(items: list[dict[str, Any]], model_key: str) -> list[zvec.Do
                     "tags": item["tags"],
                     "project": item["project"],
                     "timestamp": item["timestamp"],
+                    "filter_path": item["path"].casefold(),
+                    "filter_type": item["type"].casefold(),
+                    "filter_tags": [str(tag).casefold() for tag in item["tags"]],
+                    "filter_project": item["project"].casefold(),
+                    "filter_timestamp": item["timestamp"],
                     "text": item["text"],
                     "search_text": item["fts_text"],
                 },
@@ -647,6 +657,36 @@ def create_schema() -> zvec.CollectionSchema:
             zvec.FieldSchema("tags", zvec.DataType.ARRAY_STRING),
             zvec.FieldSchema("project", zvec.DataType.STRING),
             zvec.FieldSchema("timestamp", zvec.DataType.STRING),
+            zvec.FieldSchema(
+                "filter_path",
+                zvec.DataType.STRING,
+                nullable=False,
+                index_param=zvec.InvertIndexParam(enable_extended_wildcard=True),
+            ),
+            zvec.FieldSchema(
+                "filter_type",
+                zvec.DataType.STRING,
+                nullable=False,
+                index_param=zvec.InvertIndexParam(),
+            ),
+            zvec.FieldSchema(
+                "filter_tags",
+                zvec.DataType.ARRAY_STRING,
+                nullable=False,
+                index_param=zvec.InvertIndexParam(),
+            ),
+            zvec.FieldSchema(
+                "filter_project",
+                zvec.DataType.STRING,
+                nullable=False,
+                index_param=zvec.InvertIndexParam(),
+            ),
+            zvec.FieldSchema(
+                "filter_timestamp",
+                zvec.DataType.STRING,
+                nullable=False,
+                index_param=zvec.InvertIndexParam(enable_range_optimization=True),
+            ),
             zvec.FieldSchema(
                 "search_text",
                 zvec.DataType.STRING,
@@ -746,6 +786,45 @@ def result_matches_filters(fields: dict[str, Any], options: SearchOptions) -> bo
     return True
 
 
+def zvec_string(value: str) -> str:
+    """Возвращает безопасный строковый литерал для выражения фильтра Zvec."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def zvec_path_pattern(pattern: str) -> str:
+    """Преобразует обычную маску пути в шаблон LIKE Zvec."""
+    normalized = pattern.casefold()
+    if any(character in normalized for character in "[]%_"):
+        raise ValueError("маска пути поддерживает только символы * и ?")
+    return normalized.replace("*", "%").replace("?", "_")
+
+
+def build_zvec_filter(options: SearchOptions) -> str | None:
+    expressions: list[str] = []
+    if options.doc_type:
+        expressions.append(f"filter_type = {zvec_string(options.doc_type.casefold())}")
+    if options.project:
+        expressions.append(f"filter_project = {zvec_string(options.project.casefold())}")
+    if options.path_pattern:
+        if "*" in options.path_pattern or "?" in options.path_pattern:
+            expressions.append(
+                f"filter_path LIKE {zvec_string(zvec_path_pattern(options.path_pattern))}"
+            )
+        else:
+            expressions.append(f"filter_path = {zvec_string(options.path_pattern.casefold())}")
+    if options.tags:
+        tags = ", ".join(zvec_string(tag.casefold()) for tag in options.tags)
+        expressions.append(f"filter_tags CONTAIN_ALL ({tags})")
+    if options.date_from:
+        expressions.append("filter_timestamp != \"\"")
+        expressions.append(f"filter_timestamp >= {zvec_string(options.date_from)}")
+    if options.date_to:
+        expressions.append("filter_timestamp != \"\"")
+        upper_bound = options.date_to + "T23:59:59" if len(options.date_to) == 10 else options.date_to
+        expressions.append(f"filter_timestamp <= {zvec_string(upper_bound)}")
+    return " AND ".join(expressions) or None
+
+
 def semantic_relevance(score: float) -> float:
     return max(0.0, min(1.0, 1.0 - score))
 
@@ -802,16 +881,15 @@ def weighted_rrf(
 
 
 def hybrid_relevance(item: dict[str, Any], options: SearchOptions) -> float:
-    semantic = (
-        semantic_relevance(item["semantic_score"])
-        if item["semantic_score"] is not None
-        else 0.0
-    )
-    fts = fts_relevance(item["fts_score"]) if item["fts_score"] is not None else 0.0
-    total_weight = options.semantic_weight + options.fts_weight
-    return (
-        options.semantic_weight * semantic + options.fts_weight * fts
-    ) / total_weight
+    signals: list[tuple[float, float]] = []
+    if item["semantic_score"] is not None and options.semantic_weight > 0:
+        signals.append((options.semantic_weight, semantic_relevance(item["semantic_score"])))
+    if item["fts_score"] is not None and options.fts_weight > 0:
+        signals.append((options.fts_weight, fts_relevance(item["fts_score"])))
+    total_weight = sum(weight for weight, _ in signals)
+    if total_weight == 0:
+        return 0.0
+    return sum(weight * relevance for weight, relevance in signals) / total_weight
 
 
 def result_reason(signals: list[str], terms: list[str]) -> str:
@@ -864,6 +942,7 @@ def search_collection(
         _METRICS.record_cache(False)
 
     pool_size = max(topk, rerank_pool)
+    filter_expression = build_zvec_filter(options)
     semantic_results: list[Any] = []
     fts_results: list[Any] = []
     if search_mode in ("semantic", "hybrid") and options.semantic_weight > 0:
@@ -871,13 +950,21 @@ def search_collection(
     with _SEARCH_LOCK:
         if search_mode in ("semantic", "hybrid") and options.semantic_weight > 0:
             vector_query = zvec.Query("embedding", vector=embed(query, model_key, kind="query"))
-            semantic_results = collection.query(vector_query, topk=pool_size)
+            semantic_results = collection.query(
+                vector_query,
+                topk=pool_size,
+                filter=filter_expression,
+            )
         if search_mode in ("fts", "hybrid") and options.fts_weight > 0:
             fts_query = zvec.Query(
                 "search_text",
                 fts=zvec.Fts(match_string=normalize_fts_text(query)),
             )
-            fts_results = collection.query(fts_query, topk=pool_size)
+            fts_results = collection.query(
+                fts_query,
+                topk=pool_size,
+                filter=filter_expression,
+            )
 
     semantic_results = [
         result for result in semantic_results if result_matches_filters(doc_fields(result), options)
@@ -994,6 +1081,10 @@ def search_token() -> str:
     return read_token_file(_SEARCH_TOKEN_FILE)
 
 
+def admin_token() -> str:
+    return read_token_file(_ADMIN_TOKEN_FILE)
+
+
 def is_authorized(headers: Any) -> bool:
     expected = service_token()
     if not expected:
@@ -1015,11 +1106,26 @@ def basic_password(authorization: str) -> str:
 def is_search_authorized(headers: Any) -> bool:
     expected = search_token()
     if not expected:
-        return True
+        return os.environ.get("OKF_ZVEC_ALLOW_ANONYMOUS_SEARCH", "").casefold() in (
+            "1",
+            "true",
+            "yes",
+        )
     candidates = (
         headers.get("X-OKF-Zvec-Search-Token", ""),
         headers.get("Authorization", "").removeprefix("Bearer ").strip(),
         basic_password(headers.get("Authorization", "")),
+    )
+    return any(candidate and secrets.compare_digest(candidate, expected) for candidate in candidates)
+
+
+def is_admin_authorized(headers: Any) -> bool:
+    expected = admin_token()
+    if not expected:
+        return False
+    candidates = (
+        headers.get("X-OKF-Zvec-Admin-Token", ""),
+        headers.get("Authorization", "").removeprefix("Bearer ").strip(),
     )
     return any(candidate and secrets.compare_digest(candidate, expected) for candidate in candidates)
 
@@ -1407,6 +1513,21 @@ def benchmark_rank(results: list[dict[str, Any]], expected: str) -> int:
     return 0
 
 
+def benchmark_ranks(results: list[dict[str, Any]], relevant: list[str]) -> list[int]:
+    return [benchmark_rank(results, marker) for marker in relevant]
+
+
+def benchmark_ranking_metrics(ranks: list[int], topk: int) -> tuple[float, float]:
+    if not ranks:
+        return 0.0, 0.0
+    found_ranks = sorted({rank for rank in ranks if 0 < rank <= topk})
+    recall = sum(0 < rank <= topk for rank in ranks) / len(ranks)
+    dcg = sum(1 / math.log2(rank + 1) for rank in found_ranks)
+    ideal_count = min(len(ranks), topk)
+    ideal_dcg = sum(1 / math.log2(rank + 1) for rank in range(1, ideal_count + 1))
+    return recall, dcg / ideal_dcg if ideal_dcg else 0.0
+
+
 def benchmark_http_search(
     service_url: str,
     query: str,
@@ -1465,11 +1586,20 @@ def command_benchmark(args: argparse.Namespace) -> None:
         "modes": {},
     }
 
+    if not args.service_url and any(mode in ("semantic", "hybrid") for mode in modes):
+        with contextlib.redirect_stdout(sys.stderr):
+            get_model(model_key)
+
     for mode in modes:
         rows: list[dict[str, Any]] = []
         for test in tests:
             query = str(test["query"])
-            expected = str(test["expected_contains"])
+            raw_relevant = test.get("relevant_contains")
+            if raw_relevant is None:
+                raw_relevant = [test["expected_contains"]]
+            if not isinstance(raw_relevant, list) or not raw_relevant:
+                raise SystemExit("relevant_contains должен быть непустым JSON-массивом")
+            relevant = [str(marker) for marker in raw_relevant]
             clear_query_cache()
             started = time.perf_counter()
             if args.service_url:
@@ -1494,11 +1624,16 @@ def command_benchmark(args: argparse.Namespace) -> None:
                     options,
                 )
             elapsed_ms = (time.perf_counter() - started) * 1000
-            rank = benchmark_rank(results, expected)
+            ranks = benchmark_ranks(results, relevant)
+            rank = min((rank for rank in ranks if rank), default=0)
+            recall_at_k, ndcg_at_k = benchmark_ranking_metrics(ranks, args.topk)
             rows.append({
                 "query": query,
-                "expected_contains": expected,
+                "relevant_contains": relevant,
                 "rank": rank,
+                "relevant_ranks": ranks,
+                "recall_at_k": recall_at_k,
+                "ndcg_at_k": ndcg_at_k,
                 "elapsed_ms": round(elapsed_ms, 2),
             })
 
@@ -1507,6 +1642,8 @@ def command_benchmark(args: argparse.Namespace) -> None:
             "top1": sum(row["rank"] == 1 for row in rows) / len(rows),
             "top3": sum(0 < row["rank"] <= 3 for row in rows) / len(rows),
             "mrr": sum(reciprocal_ranks) / len(rows),
+            "recall_at_k": sum(row["recall_at_k"] for row in rows) / len(rows),
+            "ndcg_at_k": sum(row["ndcg_at_k"] for row in rows) / len(rows),
             "no_result": sum(row["rank"] == 0 for row in rows),
             "average_ms": sum(row["elapsed_ms"] for row in rows) / len(rows),
             "results": rows,
@@ -1515,7 +1652,7 @@ def command_benchmark(args: argparse.Namespace) -> None:
 
 
 class SearchHandler(BaseHTTPRequestHandler):
-    server_version = "OkfZvecSearch/0.4.1"
+    server_version = "OkfZvecSearch/0.5.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -1591,6 +1728,9 @@ class SearchHandler(BaseHTTPRequestHandler):
             self.send_json(401, {"error": "требуется авторизация"}, headers)
         else:
             self.send_html(401, "<h1>Требуется авторизация</h1>", headers)
+
+    def send_admin_unauthorized(self) -> None:
+        self.send_json(401, {"error": "требуется токен администратора"})
 
     def render_home(self) -> str:
         return r"""<!doctype html>
@@ -1819,16 +1959,24 @@ const preloadForm = document.getElementById('preloadForm');
 
 async function postAction(path, body) {{
   actionStatus.textContent = 'Выполняется...';
+  let adminToken = sessionStorage.getItem('okfZvecAdminToken');
+  if (!adminToken) {{
+    adminToken = window.prompt('Введите токен администратора') || '';
+    if (!adminToken) throw new Error('токен администратора не указан');
+    sessionStorage.setItem('okfZvecAdminToken', adminToken);
+  }}
   const response = await fetch(path, {{
     method: 'POST',
     credentials: 'same-origin',
     headers: {{
       'X-OKF-Zvec-Action': '1',
+      'X-OKF-Zvec-Admin-Token': adminToken,
       ...(body ? {{'Content-Type': 'application/x-www-form-urlencoded'}} : {{}}),
     }},
     body,
   }});
   if (!response.ok && response.status !== 202) {{
+    if (response.status === 401) sessionStorage.removeItem('okfZvecAdminToken');
     const payload = await response.json().catch(() => ({{}}));
     throw new Error(payload.error || `HTTP ${{response.status}}`);
   }}
@@ -2042,8 +2190,8 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
         parsed = urlparse(self.path)
         model_action = re.fullmatch(r"/models/([^/]+)/(load|unload|reload)", parsed.path)
         if parsed.path in ("/settings", "/actions/reload-models", "/actions/restart") or model_action:
-            if not is_search_authorized(self.headers):
-                self.send_search_unauthorized(wants_json=False)
+            if not is_admin_authorized(self.headers):
+                self.send_admin_unauthorized()
                 return
             try:
                 if self.headers.get("X-OKF-Zvec-Action") != "1":
@@ -2095,6 +2243,9 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
                 return
             except RequestError as exc:
                 self.send_request_error(exc)
+                return
+            except ValueError as exc:
+                self.send_json(400, {"error": str(exc)})
                 return
             except ModelLoadError:
                 self.send_json(503, {"error": "не удалось загрузить выбранные модели"})
