@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import contextlib
 import fnmatch
 import hashlib
@@ -91,6 +91,16 @@ _RUNTIME_SETTINGS_FILE = Path(
         str(APP_HOME / "config" / "runtime-settings.json"),
     )
 )
+_AI_HISTORY_FILE = Path(
+    os.environ.get(
+        "OKF_ZVEC_AI_HISTORY_FILE",
+        str(APP_HOME / "config" / "ai-search-history.json"),
+    )
+)
+_AI_HISTORY_LIMIT = 20
+_AI_HISTORY_LOCK = threading.Lock()
+_AI_HISTORY: deque[dict[str, Any]] = deque(maxlen=_AI_HISTORY_LIMIT)
+_AI_HISTORY_LOADED = False
 _MORPH: Any | None = None
 _MORPH_UNAVAILABLE = False
 DEFAULT_KEEP_VERSIONS = 3
@@ -1130,6 +1140,46 @@ def is_admin_authorized(headers: Any) -> bool:
     return any(candidate and secrets.compare_digest(candidate, expected) for candidate in candidates)
 
 
+def is_ai_search(headers: Any) -> bool:
+    return headers.get("X-OKF-Zvec-Origin", "").strip().casefold() == "ai"
+
+
+def load_ai_history_locked() -> None:
+    global _AI_HISTORY_LOADED
+
+    if _AI_HISTORY_LOADED:
+        return
+    try:
+        payload = json.loads(_AI_HISTORY_FILE.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            _AI_HISTORY.extend(item for item in payload[-_AI_HISTORY_LIMIT:] if isinstance(item, dict))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        pass
+    _AI_HISTORY_LOADED = True
+
+
+def record_ai_search(entry: dict[str, Any]) -> None:
+    with _AI_HISTORY_LOCK:
+        load_ai_history_locked()
+        _AI_HISTORY.append(entry)
+        try:
+            _AI_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temporary = _AI_HISTORY_FILE.with_suffix(_AI_HISTORY_FILE.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(list(_AI_HISTORY), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(_AI_HISTORY_FILE)
+        except OSError as exc:
+            log_event("ai_history_write_failed", level="error", error_type=type(exc).__name__)
+
+
+def ai_history_snapshot() -> list[dict[str, Any]]:
+    with _AI_HISTORY_LOCK:
+        load_ai_history_locked()
+        return list(reversed(_AI_HISTORY))
+
+
 def collection_doc_count(collection: Any) -> int:
     try:
         stats = json.loads(str(collection.stats))
@@ -1652,7 +1702,7 @@ def command_benchmark(args: argparse.Namespace) -> None:
 
 
 class SearchHandler(BaseHTTPRequestHandler):
-    server_version = "OkfZvecSearch/0.5.0"
+    server_version = "OkfZvecSearch/0.5.1"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -1732,6 +1782,36 @@ class SearchHandler(BaseHTTPRequestHandler):
     def send_admin_unauthorized(self) -> None:
         self.send_json(401, {"error": "требуется токен администратора"})
 
+    def record_ai_request(
+        self,
+        request_id: str,
+        query: str,
+        model: str,
+        mode: str,
+        duration: float,
+        status: str,
+        results: list[dict[str, Any]] | None = None,
+        error: str = "",
+    ) -> None:
+        if not is_ai_search(self.headers):
+            return
+        results = results or []
+        top_result = results[0] if results else {}
+        record_ai_search({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request_id": request_id,
+            "query": query[:500],
+            "model": model,
+            "mode": mode,
+            "duration_ms": round(duration * 1000, 1),
+            "status": status,
+            "result_count": len(results),
+            "top_title": str(top_result.get("title", "")),
+            "top_path": str(top_result.get("path", "")),
+            "top_relevance": top_result.get("relevance"),
+            "error": error,
+        })
+
     def render_home(self) -> str:
         return r"""<!doctype html>
 <html lang="ru">
@@ -1764,7 +1844,7 @@ class SearchHandler(BaseHTTPRequestHandler):
 <main>
   <div class="search-row">
     <h1 style="flex:1">Поиск по базе OKF</h1>
-    <a href="/status">Состояние</a>
+    <span><a href="/ai-history">Запросы ИИ</a> · <a href="/status">Состояние</a></span>
   </div>
   <form id="searchForm">
     <div class="search-row">
@@ -1874,6 +1954,87 @@ function escapeHtml(value) {
 </body>
 </html>"""
 
+    def render_ai_history(self) -> str:
+        history = ai_history_snapshot()
+        history_rows = []
+        for entry in history:
+            timestamp = str(entry.get("timestamp", ""))
+            try:
+                timestamp = datetime.fromisoformat(timestamp).astimezone().strftime("%d.%m %H:%M:%S")
+            except ValueError:
+                pass
+            top_title = str(entry.get("top_title", ""))
+            top_path = str(entry.get("top_path", ""))
+            top_result = top_title or top_path or "—"
+            if top_title and top_path:
+                top_result += f" ({top_path})"
+            relevance = entry.get("top_relevance")
+            relevance_text = f"{float(relevance) * 100:.0f}%" if relevance is not None else "—"
+            status = "успех"
+            if entry.get("status") != "success":
+                status = "ошибка: " + str(entry.get("error", ""))
+            history_rows.append(
+                "<tr>"
+                f"<td>{html.escape(timestamp)}</td>"
+                f"<td class=\"history-query\">{html.escape(str(entry.get('query', '')))}</td>"
+                f"<td>{html.escape(str(entry.get('model', '')))} / "
+                f"{html.escape(str(entry.get('mode', '')))}</td>"
+                f"<td>{float(entry.get('duration_ms', 0)):.0f} мс</td>"
+                f"<td>{int(entry.get('result_count', 0))}</td>"
+                f"<td>{html.escape(top_result)}</td>"
+                f"<td>{relevance_text}</td>"
+                f"<td>{html.escape(status)}</td>"
+                "</tr>"
+            )
+        if not history_rows:
+            history_rows.append('<tr><td colspan="8">Запросов от ИИ пока нет.</td></tr>')
+
+        successful = [entry for entry in history if entry.get("status") == "success"]
+        errors = len(history) - len(successful)
+        empty = sum(int(entry.get("result_count", 0)) == 0 for entry in successful)
+        average_duration = (
+            sum(float(entry.get("duration_ms", 0)) for entry in successful) / len(successful)
+            if successful
+            else 0
+        )
+        relevances = [
+            float(entry["top_relevance"])
+            for entry in successful
+            if entry.get("top_relevance") is not None
+        ]
+        average_relevance = sum(relevances) / len(relevances) * 100 if relevances else 0
+        return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Запросы ИИ · OKF zvec</title>
+  <style>
+    body {{ font-family: system-ui, Segoe UI, Arial, sans-serif; margin: 32px; color: #1f2937; background: #f8fafc; }}
+    main {{ max-width: 1240px; margin: 0 auto; }}
+    .summary {{ color: #475569; margin-bottom: 20px; }}
+    .table-scroll {{ overflow-x: auto; }}
+    table {{ width: 100%; border-collapse: collapse; background: white; }}
+    th, td {{ text-align: left; padding: 10px; border: 1px solid #e2e8f0; vertical-align: top; }}
+    th {{ white-space: nowrap; }}
+    .history-query {{ min-width: 190px; max-width: 300px; overflow-wrap: anywhere; }}
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="/">Поиск</a> · <a href="/status">Состояние</a></p>
+  <h1>Последние запросы ИИ</h1>
+  <p class="summary">В выборке: {len(history)} из {_AI_HISTORY_LIMIT} · без результатов: {empty} · ошибок: {errors} · среднее время: {average_duration:.0f} мс · средняя релевантность первого результата: {average_relevance:.0f}%</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Время</th><th>Запрос</th><th>Модель / режим</th><th>Длительность</th><th>Найдено</th><th>Лучший результат</th><th>Релевантность</th><th>Статус</th></tr></thead>
+      <tbody>{''.join(history_rows)}</tbody>
+    </table>
+  </div>
+</main>
+</body>
+</html>"""
+
     def render_status(self) -> str:
         state = status_snapshot()
         _, preload_models = configured_preload_setting()
@@ -1928,7 +2089,7 @@ function escapeHtml(value) {
 </head>
 <body>
 <main>
-  <p><a href="/">Поиск</a></p>
+  <p><a href="/">Поиск</a> · <a href="/ai-history">Запросы ИИ</a></p>
   <h1>Состояние сервиса</h1>
   <dl>
     <dt>Активный индекс</dt><dd>{html.escape(str(state['active_db_root']))}</dd>
@@ -2035,6 +2196,9 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
         if parsed.path == "/status":
             self.send_html(200, self.render_status())
             return
+        if parsed.path == "/ai-history":
+            self.send_html(200, self.render_ai_history())
+            return
         if parsed.path == "/status.json":
             self.send_json(200, status_snapshot())
             return
@@ -2060,6 +2224,7 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
         started = time.perf_counter()
         model_key = "unknown"
         search_mode = "unknown"
+        query = ""
         try:
             params = parse_qs(parsed.query)
             query = (params.get("q") or params.get("query") or [""])[0]
@@ -2142,6 +2307,15 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
             )
             duration = time.perf_counter() - started
             _METRICS.record_search(model_key, search_mode, "success", duration)
+            self.record_ai_request(
+                request_id,
+                query,
+                model_key,
+                search_mode,
+                duration,
+                "success",
+                results,
+            )
             log_event(
                 "search_completed",
                 request_id=request_id,
@@ -2154,10 +2328,22 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
         except RequestError as exc:
             duration = time.perf_counter() - started
             _METRICS.record_search(model_key, search_mode, "error", duration)
+            self.record_ai_request(
+                request_id, query, model_key, search_mode, duration, "error", error=exc.message
+            )
             self.send_request_error(exc, request_id)
         except ModelLoadError as exc:
             duration = time.perf_counter() - started
             _METRICS.record_search(model_key, search_mode, "error", duration)
+            self.record_ai_request(
+                request_id,
+                query,
+                model_key,
+                search_mode,
+                duration,
+                "error",
+                error="модель поиска временно недоступна",
+            )
             log_event(
                 "search_failed",
                 level="error",
@@ -2175,6 +2361,15 @@ document.querySelectorAll('[data-action]').forEach((link) => {{
         except Exception as exc:
             duration = time.perf_counter() - started
             _METRICS.record_search(model_key, search_mode, "error", duration)
+            self.record_ai_request(
+                request_id,
+                query,
+                model_key,
+                search_mode,
+                duration,
+                "error",
+                error="внутренняя ошибка сервиса",
+            )
             log_event(
                 "search_failed",
                 level="error",

@@ -9,6 +9,7 @@ EnvironmentFile=-/etc/okf-zvec-search.env
 Environment=OKF_ZVEC_HOME=/opt/okf-zvec-search
 Environment=OKF_ZVEC_SEARCH_TOKEN_FILE=/opt/okf-zvec-search/config/search-token
 Environment=OKF_ZVEC_ADMIN_TOKEN_FILE=/opt/okf-zvec-search/config/admin-token
+Environment=OKF_ZVEC_AI_HISTORY_FILE=/opt/okf-zvec-search/config/ai-search-history.json
 Environment=HF_HOME=/opt/okf-zvec-search/data/huggingface
 Environment=OKF_ZVEC_KEEP_VERSIONS=3
 Environment=OKF_ZVEC_SEMANTIC_WEIGHT=1

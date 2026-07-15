@@ -20,6 +20,8 @@ param(
     [string]$Project = "",
     [string]$DateFrom = "",
     [string]$DateTo = "",
+    [ValidateSet("manual", "ai")]
+    [string]$Origin = "manual",
     [string]$TokenFile = $env:OKF_ZVEC_SEARCH_TOKEN_FILE
 )
 
@@ -43,6 +45,9 @@ $curlArgs = @(
 if ($TokenFile) {
     $token = (Get-Content -Raw -LiteralPath $TokenFile).Trim()
     $curlArgs += @("--user", "okf:$token")
+}
+if ($Origin -eq "ai") {
+    $curlArgs += @("--header", "X-OKF-Zvec-Origin: ai")
 }
 $curlArgs += "$ServiceUrl/search"
 $json = & curl.exe @curlArgs

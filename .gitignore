@@ -10,6 +10,7 @@ search-token
 config/service-token
 config/search-token
 config/runtime-settings.json
+config/ai-search-history.json
 data/
 *.tgz
 *.tar.gz

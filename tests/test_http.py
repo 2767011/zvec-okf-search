@@ -135,6 +135,33 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(payload["error"], "внутренняя ошибка сервиса")
         self.assertNotIn("private", json.dumps(payload))
 
+    def test_ai_search_is_added_to_observability_history(self):
+        result = {
+            "rank": 1,
+            "relevance": 0.91,
+            "score": 0.09,
+            "title": "Миграция АТС",
+            "path": "topics/telephony.md",
+            "heading": "",
+            "text": "",
+            "match_terms": [],
+        }
+        with (
+            mock.patch.object(okf_zvec, "search_collection", return_value=[result]),
+            mock.patch.object(okf_zvec, "record_ai_search") as record_history,
+        ):
+            status, _ = self.request(
+                "GET",
+                "/search?q=telephony",
+                headers={"X-OKF-Zvec-Origin": "ai"},
+            )
+
+        self.assertEqual(status, 200)
+        entry = record_history.call_args.args[0]
+        self.assertEqual(entry["query"], "telephony")
+        self.assertEqual(entry["top_relevance"], 0.91)
+        self.assertEqual(entry["status"], "success")
+
     def test_sync_rejects_oversized_body_before_reading(self):
         okf_zvec._SERVICE_TOKEN_FILE.write_text("secret", encoding="utf-8")
         with mock.patch.dict("os.environ", {"OKF_ZVEC_MAX_SYNC_BYTES": "4"}):

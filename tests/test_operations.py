@@ -4,6 +4,7 @@ import io
 import json
 import tempfile
 import unittest
+from collections import deque
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -130,7 +131,51 @@ class OperationsTests(unittest.TestCase):
         self.assertIn('data-action="model-load"', page)
         self.assertIn('data-action="model-unload"', page)
         self.assertIn('data-action="restart"', page)
+        self.assertIn('href="/ai-history"', page)
+        self.assertNotIn("Последние запросы ИИ", page)
         self.assertNotIn("<button", page)
+
+    def test_ai_history_has_a_separate_page(self):
+        history = [{
+            "timestamp": "2026-07-15T10:00:00+05:00",
+            "query": "переезд телефонии",
+            "model": "e5",
+            "mode": "hybrid",
+            "duration_ms": 42,
+            "result_count": 3,
+            "top_title": "Миграция АТС",
+            "top_path": "topics/telephony.md",
+            "top_relevance": 0.91,
+            "status": "success",
+        }]
+        with mock.patch.object(okf_zvec, "ai_history_snapshot", return_value=history):
+            page = okf_zvec.SearchHandler.render_ai_history(None)
+
+        self.assertIn("Последние запросы ИИ", page)
+        self.assertIn("переезд телефонии", page)
+        self.assertIn("91%", page)
+        self.assertIn("В выборке: 1 из 20", page)
+
+    def test_ai_history_is_persistent_and_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_file = Path(tmp) / "history.json"
+            old_history = okf_zvec._AI_HISTORY
+            old_loaded = okf_zvec._AI_HISTORY_LOADED
+            try:
+                okf_zvec._AI_HISTORY = deque(maxlen=okf_zvec._AI_HISTORY_LIMIT)
+                okf_zvec._AI_HISTORY_LOADED = False
+                with mock.patch.object(okf_zvec, "_AI_HISTORY_FILE", history_file):
+                    for number in range(22):
+                        okf_zvec.record_ai_search({"query": f"query-{number}"})
+                    history = okf_zvec.ai_history_snapshot()
+
+                self.assertEqual(len(history), 20)
+                self.assertEqual(history[0]["query"], "query-21")
+                self.assertEqual(history[-1]["query"], "query-2")
+                self.assertEqual(len(json.loads(history_file.read_text(encoding="utf-8"))), 20)
+            finally:
+                okf_zvec._AI_HISTORY = old_history
+                okf_zvec._AI_HISTORY_LOADED = old_loaded
 
 
 if __name__ == "__main__":
