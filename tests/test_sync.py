@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import okf_zvec
+from okf_zvec_search import indexing as okf_zvec
 
 
 class FakeCollection:

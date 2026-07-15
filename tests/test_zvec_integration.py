@@ -67,7 +67,12 @@ class ZvecIntegrationTests(unittest.TestCase):
                 zvec.Doc(
                     "opposite",
                     vectors={"embedding": [-1.0, 0.0]},
-                    fields={"category": "a", "tags": ["blue"], "path": "topics/old.md", "timestamp": "2025-01-01"},
+                    fields={
+                        "category": "a",
+                        "tags": ["blue"],
+                        "path": "topics/old.md",
+                        "timestamp": "2025-01-01",
+                    },
                 ),
             ]
         )

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "okf-zvec-search"
-version = "0.6.0"
+version = "0.7.0"
 description = "Семантический, полнотекстовый и гибридный поиск по OKF Markdown"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,10 +21,11 @@ dependencies = [
 dev = ["ruff>=0.12"]
 
 [project.scripts]
-okf-zvec = "okf_zvec:main"
+okf-zvec = "okf_zvec_search.cli:main"
 
 [tool.setuptools]
 py-modules = ["okf_zvec"]
+packages = ["okf_zvec_search"]
 package-dir = { "" = "src" }
 
 [tool.ruff]

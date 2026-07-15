@@ -1,12 +1,12 @@
 import unittest
 
-import okf_zvec
+from okf_zvec_search import text as okf_zvec
 
 
 class TextProcessingTests(unittest.TestCase):
     def test_frontmatter_is_removed(self):
         metadata, body = okf_zvec.split_frontmatter(
-            '---\ntype: service\ntitle: Проверка\n---\n\n# Содержимое\n'
+            "---\ntype: service\ntitle: Проверка\n---\n\n# Содержимое\n"
         )
         self.assertEqual(metadata["type"], "service")
         self.assertEqual(metadata["title"], "Проверка")

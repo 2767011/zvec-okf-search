@@ -2,7 +2,8 @@ import threading
 import unittest
 from unittest import mock
 
-import okf_zvec
+from okf_zvec_search import cli, config
+from okf_zvec_search import search as okf_zvec
 
 
 def result(identifier, score, **fields):
@@ -31,12 +32,12 @@ class SearchQualityTests(unittest.TestCase):
         semantic_first = okf_zvec.weighted_rrf(
             [first, second],
             [second, first],
-            okf_zvec.SearchOptions(semantic_weight=3, fts_weight=1),
+            config.SearchOptions(semantic_weight=3, fts_weight=1),
         )
         fts_first = okf_zvec.weighted_rrf(
             [first, second],
             [second, first],
-            okf_zvec.SearchOptions(semantic_weight=1, fts_weight=3),
+            config.SearchOptions(semantic_weight=1, fts_weight=3),
         )
 
         self.assertEqual(okf_zvec.doc_id(semantic_first[0]["result"]), "first")
@@ -50,7 +51,7 @@ class SearchQualityTests(unittest.TestCase):
             "path": "topics/zvec.md",
             "timestamp": "2026-07-09T10:00:00+05:00",
         }
-        options = okf_zvec.SearchOptions(
+        options = config.SearchOptions(
             doc_type="software-project",
             tags=("zvec",),
             project="search",
@@ -63,7 +64,7 @@ class SearchQualityTests(unittest.TestCase):
         self.assertFalse(
             okf_zvec.result_matches_filters(
                 fields,
-                okf_zvec.SearchOptions(tags=("missing",)),
+                config.SearchOptions(tags=("missing",)),
             )
         )
 
@@ -72,13 +73,11 @@ class SearchQualityTests(unittest.TestCase):
         self.assertIn('filter_tags CONTAIN_ALL ("zvec")', expression)
         self.assertIn('filter_path LIKE "topics/%"', expression)
 
-        exact_path = okf_zvec.build_zvec_filter(
-            okf_zvec.SearchOptions(path_pattern="topics/my_note.md")
-        )
+        exact_path = okf_zvec.build_zvec_filter(config.SearchOptions(path_pattern="topics/my_note.md"))
         self.assertEqual(exact_path, 'filter_path = "topics/my_note.md"')
 
     def test_hybrid_relevance_uses_only_available_signals(self):
-        options = okf_zvec.SearchOptions(semantic_weight=0.7, fts_weight=0.3)
+        options = config.SearchOptions(semantic_weight=0.7, fts_weight=0.3)
         item = {"semantic_score": None, "fts_score": 3.0}
         self.assertAlmostEqual(okf_zvec.hybrid_relevance(item, options), 0.75)
 
@@ -103,11 +102,11 @@ class SearchQualityTests(unittest.TestCase):
             {"rank": 1, "title": "Другое", "heading": "", "path": "", "text": ""},
             {"rank": 2, "title": "POS Center", "heading": "", "path": "", "text": ""},
         ]
-        self.assertEqual(okf_zvec.benchmark_rank(results, "POS Center"), 2)
-        self.assertEqual(okf_zvec.benchmark_rank(results, "Отсутствует"), 0)
+        self.assertEqual(cli.benchmark_rank(results, "POS Center"), 2)
+        self.assertEqual(cli.benchmark_rank(results, "Отсутствует"), 0)
 
     def test_benchmark_metrics_support_multiple_relevant_results(self):
-        recall, ndcg = okf_zvec.benchmark_ranking_metrics([1, 3, 0], topk=3)
+        recall, ndcg = cli.benchmark_ranking_metrics([1, 3, 0], topk=3)
         self.assertAlmostEqual(recall, 2 / 3)
         self.assertGreater(ndcg, 0.6)
         self.assertLess(ndcg, 1.0)
@@ -123,8 +122,7 @@ class SearchQualityTests(unittest.TestCase):
 
         okf_zvec._QUERY_CACHE.clear()
         with (
-            mock.patch.object(okf_zvec, "get_model"),
-            mock.patch.object(okf_zvec, "embed", return_value=[0.0] * okf_zvec.DIMENSION),
+            mock.patch.object(okf_zvec, "embed", return_value=[0.0] * config.DIMENSION),
         ):
             results = okf_zvec.search_collection(
                 FakeCollection(),
@@ -132,7 +130,7 @@ class SearchQualityTests(unittest.TestCase):
                 topk=5,
                 rerank_pool=5,
                 search_mode="semantic",
-                options=okf_zvec.SearchOptions(min_relevance=0.5),
+                options=config.SearchOptions(min_relevance=0.5),
             )
 
         self.assertEqual([item["id"] for item in results], ["strong"])
@@ -148,7 +146,7 @@ class SearchQualityTests(unittest.TestCase):
 
         def fake_embed(*_args, **_kwargs):
             embedding_started.set()
-            return [0.0] * okf_zvec.DIMENSION
+            return [0.0] * config.DIMENSION
 
         def run_search():
             try:
